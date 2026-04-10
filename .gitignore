@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+data/sessions/
+data/tmp/
+.DS_Store
+.idea/
