@@ -62,7 +62,7 @@ async def _download_with_retry(
         save_as: str,
         progress: TransferProgress,
         retries: int = MAX_RETRIES,
-) -> str:
+) -> str | None:
     for attempt in range(1, retries + 1):
         try:
             await client.download(file_inline, save_as=save_as, callback=progress.callback)
@@ -74,6 +74,7 @@ async def _download_with_retry(
             wait = 2 ** attempt
             print(f"  Download failed (attempt {attempt}/{retries}), retrying in {wait}s... ({exc})")
             await asyncio.sleep(wait)
+    return None
 
 
 async def receive_relay_files(client: Client, output_dir: Path) -> list[dict]:

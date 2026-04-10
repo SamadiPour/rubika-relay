@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
-import shutil
 import sys
 from pathlib import Path
 
@@ -40,7 +39,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help=(
-            "Base directory for sessions/tmp. "
+            "Base directory for session storage. "
             f"Defaults to ${ENV_DATA_DIR} or {default_data_dir()}."
         ),
     )
@@ -49,42 +48,27 @@ def parse_args() -> argparse.Namespace:
 
     send_p = sub.add_parser("send", help="Send a file to Saved Messages.")
     send_p.add_argument("file", type=Path, help="Path to the file to send.")
+    send_p.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Ignore existing local send state and start upload preparation from scratch.",
+    )
 
     recv_p = sub.add_parser("receive", help="Download relay files from Saved Messages.")
     recv_p.add_argument("--output-dir", type=Path, default=Path.cwd(), help="Directory to save files (default: CWD).")
 
-    sub.add_parser("logout", help="Clear local session and temporary files.")
+    sub.add_parser("logout", help="Clear local session file.")
 
     return parser.parse_args()
 
 
-def _paths_for(data_dir: Path) -> tuple[Path, Path]:
-    return data_dir / "sessions", data_dir / "tmp"
-
-
-def _clear_tmp_dir(tmp_dir: Path) -> int:
-    if not tmp_dir.exists():
-        return 0
-
-    removed = 0
-    for entry in tmp_dir.iterdir():
-        if entry.is_dir():
-            shutil.rmtree(entry, ignore_errors=True)
-            removed += 1
-            continue
-
-        try:
-            entry.unlink(missing_ok=True)
-            removed += 1
-        except OSError:
-            continue
-
-    return removed
+def _session_dir_for(data_dir: Path) -> Path:
+    return data_dir / "sessions"
 
 
 async def cmd_send(args: argparse.Namespace) -> int:
     data_dir = resolve_data_dir(args.data_dir)
-    session_dir, tmp_dir = _paths_for(data_dir)
+    session_dir = _session_dir_for(data_dir)
 
     client = await login_with_persisted_session(
         session_name=args.session_name,
@@ -94,7 +78,7 @@ async def cmd_send(args: argparse.Namespace) -> int:
     print("Session ready.")
 
     try:
-        message_ids, password = await send_relay_file(client, args.file, tmp_dir)
+        message_ids, password = await send_relay_file(client, args.file, fresh=args.fresh)
         print()
         print(f"Sent {len(message_ids)} part(s) to Saved Messages.")
         print(f"Archive password: {password}")
@@ -108,7 +92,7 @@ async def cmd_send(args: argparse.Namespace) -> int:
 
 async def cmd_receive(args: argparse.Namespace) -> int:
     data_dir = resolve_data_dir(args.data_dir)
-    session_dir, _ = _paths_for(data_dir)
+    session_dir = _session_dir_for(data_dir)
 
     client = await login_with_persisted_session(
         session_name=args.session_name,
@@ -134,10 +118,9 @@ async def cmd_receive(args: argparse.Namespace) -> int:
 
 async def cmd_logout(args: argparse.Namespace) -> int:
     data_dir = resolve_data_dir(args.data_dir)
-    session_dir, tmp_dir = _paths_for(data_dir)
+    session_dir = _session_dir_for(data_dir)
 
     removed_session = clear_local_session(args.session_name, session_dir)
-    removed_tmp = _clear_tmp_dir(tmp_dir)
 
     print("Local logout completed.")
     if removed_session:
@@ -145,7 +128,6 @@ async def cmd_logout(args: argparse.Namespace) -> int:
     else:
         print("No session file found to remove.")
 
-    print(f"Cleared {removed_tmp} item(s) from tmp storage.")
     print("Next command run will require login (OTP) again.")
     return 0
 

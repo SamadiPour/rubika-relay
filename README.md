@@ -6,7 +6,7 @@ It supports three operations:
 
 - `send`: zip + encrypt + split (if needed) + upload file parts.
 - `receive`: download relay parts, verify SHA-256, and clean up verified messages.
-- `logout`: clear local session and temporary files.
+- `logout`: clear local session file.
 
 ## What it does
 
@@ -15,8 +15,9 @@ It supports three operations:
 3. When sending:
 
 - Creates an AES-encrypted zip archive.
-- Splits large archives into parts (200 MB per part).
+- Splits large archives into parts (100 MB per part).
 - Sends each part to Saved Messages with caption metadata and SHA-256.
+- Persists upload state per file and resumes from the first unsent part on rerun.
 
 4. When receiving:
 
@@ -45,6 +46,9 @@ python -m pip install -e .
 # Send a file
 rubika-relay send /absolute/or/relative/path/to/file.ext
 
+# Force a fresh upload state (ignore resume state)
+rubika-relay send --fresh /absolute/or/relative/path/to/file.ext
+
 # Receive relay files into a folder
 rubika-relay receive --output-dir ./downloads
 
@@ -56,11 +60,16 @@ rubika-relay logout
 
 - Default base directory: `~/.rubika-relay/`
 - Session files: `~/.rubika-relay/sessions/<session-name>.rp`
-- Temporary archives/parts: `~/.rubika-relay/tmp/` (removed automatically after send attempt)
+- Per-file send state for uploads: `<source-file-name>.relay-state/` next to the source file
+  - Contains encrypted archive, split parts, and `send_state.json`
+  - Removed automatically after a full successful send
+  - Kept after interruptions/failures so reruns can resume
 
-If `--data-dir` or `RUBIKA_RELAY_DATA_DIR` is set, those paths are used instead.
+If `--data-dir` or `RUBIKA_RELAY_DATA_DIR` is set, session paths are redirected there.
+Per-file send state remains next to the source file so resume data stays with that file.
 
 ## Notes
 
 - The archive password is printed after a successful `send`; keep it safe.
 - If the session is valid, OTP is skipped automatically.
+- Resume currently works at part level. If a transient error happens mid-part, only that same part is retried.

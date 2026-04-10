@@ -1,50 +1,156 @@
 from __future__ import annotations
 
 import asyncio
+import random
+import time
 from pathlib import Path
+from typing import Any
 
 from rubpy import Client
+from rubpy.types import Update
 
-from .config import MAX_RETRIES, RELAY_TAG
+from .config import (
+    MAX_RETRIES,
+    RELAY_TAG,
+    RETRY_BASE_DELAY_SECONDS,
+    RETRY_JITTER_SECONDS,
+    RETRY_MAX_DELAY_SECONDS,
+)
 from .errors import CliError
 from .file_ops import (
     create_encrypted_zip,
-    ensure_dir,
     remove_file_safely,
     sha256_hash,
     split_file,
 )
 from .progress import TransferProgress
+from .send_state import (
+    build_new_state,
+    clear_state_dir,
+    first_unsent_part_index,
+    load_state,
+    resumable_parts_exist,
+    save_state,
+    state_dir_for_source,
+    state_matches_source,
+)
+
+
+def _is_retryable_error(exc: Exception) -> bool:
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError)):
+        return True
+
+    text = f"{type(exc).__name__}: {exc}".lower()
+    non_retryable_markers = (
+        "file not found",
+        "no such file",
+        "permission denied",
+        "is a directory",
+        "invalid path",
+        "invalid file",
+        "bad request",
+    )
+    if any(marker in text for marker in non_retryable_markers):
+        return False
+
+    retryable_markers = (
+        "timeout",
+        "timed out",
+        "network",
+        "connection",
+        "temporar",
+        "reset",
+        "unavailable",
+        "try again",
+        "too many requests",
+        "429",
+        "flood",
+    )
+    if any(marker in text for marker in retryable_markers):
+        return True
+
+    # Unknown remote/upload errors are treated as transient by default.
+    return True
 
 
 async def _send_with_retry(
         client: Client,
         file_path: Path,
         caption: str,
-        progress: TransferProgress,
         retries: int = MAX_RETRIES,
-):
+) -> tuple[Update, int] | None:
     for attempt in range(1, retries + 1):
+        progress = TransferProgress("  Upload")
         try:
-            return await client.send_document(
+            result = await client.send_document(
                 object_guid="me",
                 document=str(file_path),
                 caption=caption,
                 callback=progress.callback,
             )
+            progress.finish()
+            return result, attempt
         except Exception as exc:
             progress.finish()
+            if not _is_retryable_error(exc):
+                raise CliError(f"Non-retryable error while sending {file_path.name}: {exc}") from exc
             if attempt == retries:
                 raise CliError(f"Failed to send {file_path.name} after {retries} attempts: {exc}") from exc
-            wait = 2 ** attempt
-            print(f"  Send failed (attempt {attempt}/{retries}), retrying in {wait}s... ({exc})")
+            base_wait = min(RETRY_MAX_DELAY_SECONDS, RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1)))
+            wait = base_wait + random.uniform(0.0, RETRY_JITTER_SECONDS)
+            print(f"  Send failed (attempt {attempt}/{retries}), retrying in {wait:.1f}s... ({exc})")
             await asyncio.sleep(wait)
+    return None
+
+
+def _build_part_entries(parts: list[Path]) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for idx, part_path in enumerate(parts, 1):
+        entries.append(
+            {
+                "index": idx,
+                "name": part_path.name,
+                "size": part_path.stat().st_size,
+                "sha256": sha256_hash(part_path),
+                "message_id": None,
+                "attempts": 0,
+                "sent_at": None,
+            }
+        )
+    return entries
+
+
+def _load_or_prepare_state(file_path: Path, state_dir: Path, fresh: bool) -> tuple[dict[str, Any], bool]:
+    if fresh:
+        clear_state_dir(state_dir)
+
+    state = load_state(state_dir)
+    if state and state_matches_source(state, file_path) and resumable_parts_exist(state_dir, state):
+        return state, True
+
+    if state:
+        print("Existing send state is stale or incomplete. Starting fresh upload state.")
+        clear_state_dir(state_dir)
+
+    state_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Zipping {file_path.name}...")
+    zip_path, password = create_encrypted_zip(file_path, state_dir)
+    parts = split_file(zip_path)
+    state = build_new_state(
+        source_file=file_path,
+        zip_name=zip_path.name,
+        password=password,
+        part_entries=_build_part_entries(parts),
+    )
+    save_state(state_dir, state)
+    return state, False
 
 
 async def send_relay_file(
         client: Client,
         file_path: Path,
-        tmp_dir: Path,
+        *,
+        fresh: bool = False,
 ) -> tuple[list[str], str]:
     """Zip, split, hash, and send a file to Saved Messages.
 
@@ -53,43 +159,84 @@ async def send_relay_file(
     if not file_path.is_file():
         raise CliError(f"File not found: {file_path}")
 
-    ensure_dir(tmp_dir)
-    original_name = file_path.name
+    state_dir = state_dir_for_source(file_path)
+    state, resumed = _load_or_prepare_state(file_path, state_dir, fresh=fresh)
+    original_name = state.get("source", {}).get("name", file_path.name)
+    password = state.get("archive", {}).get("password")
+    if not password:
+        raise CliError("Missing archive password in send state.")
 
-    print(f"Zipping {original_name}...")
-    zip_path, password = create_encrypted_zip(file_path, tmp_dir)
+    parts = state.get("parts") or []
+    total = len(parts)
+    if total == 0:
+        raise CliError("Send state has no parts to upload.")
 
-    temp_files: list[Path] = [zip_path]
-    sent_successfully = False
+    start_idx = first_unsent_part_index(state)
+    if resumed and start_idx <= total:
+        print(f"Resuming upload from part {start_idx}/{total}...")
+
+    if start_idx > total:
+        message_ids = [str(part.get("message_id") or "unknown") for part in parts]
+        print("Upload already completed in local state. Cleaning up local state directory.")
+        clear_state_dir(state_dir)
+        if file_path.suffix.lower() == ".zip":
+            remove_file_safely(file_path)
+            print(f"Source zip removed after successful send: {file_path.name}")
+        return message_ids, str(password)
+
     try:
-        parts = split_file(zip_path)
-        if parts[0] != zip_path:
-            temp_files.extend(parts)
-        total = len(parts)
+        for part in parts[start_idx - 1:]:
+            if part.get("message_id"):
+                continue
 
-        message_ids: list[str] = []
-        for idx, part_path in enumerate(parts, 1):
-            file_hash = sha256_hash(part_path)
+            idx = int(part.get("index") or 0)
+            if idx <= 0:
+                raise CliError("Corrupted send state: invalid part index.")
+
+            part_name = part.get("name")
+            if not isinstance(part_name, str) or not part_name:
+                raise CliError("Corrupted send state: invalid part name.")
+
+            part_path = state_dir / part_name
+            if not part_path.is_file():
+                raise CliError(
+                    f"Missing local part file for resume: {part_path}. "
+                    "Re-run with --fresh to rebuild local upload parts."
+                )
+
+            file_hash = str(part.get("sha256") or sha256_hash(part_path))
+            part["sha256"] = file_hash
             caption = f"{RELAY_TAG} {original_name} | {idx}/{total} | sha256:{file_hash}"
 
             print(f"Sending part {idx}/{total} ({part_path.name})...")
-            progress = TransferProgress("  Upload")
-            result = await _send_with_retry(client, part_path, caption, progress)
-            progress.finish()
+            result, used_attempts = await _send_with_retry(client, part_path, caption)
             mid = _extract_message_id(result)
-            message_ids.append(mid)
+            part["message_id"] = mid
+            part["sent_at"] = time.time()
+            part["attempts"] = int(part.get("attempts") or 0) + used_attempts
+            state["status"] = "uploading"
+            state["last_error"] = None
+            save_state(state_dir, state)
             print(f"  Sent (message {mid})")
 
-        sent_successfully = True
-        return message_ids, password
+        state["status"] = "completed"
+        state["last_error"] = None
+        save_state(state_dir, state)
 
-    finally:
-        for f in temp_files:
-            remove_file_safely(f)
+        message_ids = [str(part.get("message_id") or "unknown") for part in parts]
+        clear_state_dir(state_dir)
 
-        if sent_successfully and file_path.suffix.lower() == ".zip":
+        if file_path.suffix.lower() == ".zip":
             remove_file_safely(file_path)
             print(f"Source zip removed after successful send: {file_path.name}")
+
+        return message_ids, str(password)
+
+    except Exception as exc:
+        state["status"] = "interrupted"
+        state["last_error"] = str(exc)
+        save_state(state_dir, state)
+        raise
 
 
 def _extract_message_id(result) -> str:
