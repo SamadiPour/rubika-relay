@@ -9,6 +9,7 @@ from rubpy import Client
 from .config import MAX_RETRIES, RELAY_TAG
 from .errors import CliError
 from .file_ops import sha256_hash
+from .progress import TransferProgress
 
 _CAPTION_RE = re.compile(
     re.escape(RELAY_TAG) + r"\s+(.+?)\s+\|\s+(\d+)/(\d+)\s+\|\s+sha256:([0-9a-f]{64})"
@@ -59,13 +60,15 @@ async def _download_with_retry(
         client: Client,
         file_inline,
         save_as: str,
+        progress: TransferProgress,
         retries: int = MAX_RETRIES,
 ) -> str:
     for attempt in range(1, retries + 1):
         try:
-            await client.download(file_inline, save_as=save_as)
+            await client.download(file_inline, save_as=save_as, callback=progress.callback)
             return save_as
         except Exception as exc:
+            progress.finish()
             if attempt == retries:
                 raise CliError(f"Download failed after {retries} attempts: {exc}") from exc
             wait = 2 ** attempt
@@ -105,7 +108,9 @@ async def receive_relay_files(client: Client, output_dir: Path) -> list[dict]:
         save_path = output_dir / file_name
 
         print(f"Downloading {file_name} (part {meta['part']}/{meta['total']})...")
-        await _download_with_retry(client, file_inline, str(save_path))
+        progress = TransferProgress("  Download")
+        await _download_with_retry(client, file_inline, str(save_path), progress)
+        progress.finish()
 
         actual_hash = sha256_hash(save_path)
         if actual_hash == meta["sha256"]:

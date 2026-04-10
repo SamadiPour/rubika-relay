@@ -14,12 +14,14 @@ from .file_ops import (
     sha256_hash,
     split_file,
 )
+from .progress import TransferProgress
 
 
 async def _send_with_retry(
         client: Client,
         file_path: Path,
         caption: str,
+        progress: TransferProgress,
         retries: int = MAX_RETRIES,
 ):
     for attempt in range(1, retries + 1):
@@ -28,8 +30,10 @@ async def _send_with_retry(
                 object_guid="me",
                 document=str(file_path),
                 caption=caption,
+                callback=progress.callback,
             )
         except Exception as exc:
+            progress.finish()
             if attempt == retries:
                 raise CliError(f"Failed to send {file_path.name} after {retries} attempts: {exc}") from exc
             wait = 2 ** attempt
@@ -69,7 +73,9 @@ async def send_relay_file(
             caption = f"{RELAY_TAG} {original_name} | {idx}/{total} | sha256:{file_hash}"
 
             print(f"Sending part {idx}/{total} ({part_path.name})...")
-            result = await _send_with_retry(client, part_path, caption)
+            progress = TransferProgress("  Upload")
+            result = await _send_with_retry(client, part_path, caption, progress)
+            progress.finish()
             mid = _extract_message_id(result)
             message_ids.append(mid)
             print(f"  Sent (message {mid})")
