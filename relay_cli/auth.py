@@ -84,3 +84,23 @@ async def _ensure_client_guid(client: Client) -> None:
         raise CliError("Authentication succeeded but user GUID is unavailable.")
 
     client.guid = str(guid)
+
+
+def clear_local_session(session_name: str, session_dir: Path) -> bool:
+    """Remove the persisted session file for a session name.
+
+    Returns True when a session file existed and was removed.
+    """
+    ensure_dir(session_dir)
+    session_file = session_dir / f"{session_name}.rp"
+    existed = session_file.exists()
+
+    if not existed:
+        return False
+
+    try:
+        session_file.unlink()
+    except OSError as exc:
+        raise CliError(f"Failed to remove session file: {exc}") from exc
+
+    return True

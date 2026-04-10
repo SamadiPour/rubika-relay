@@ -1,2 +1,2 @@
-git+https://github.com/shayanheidari01/rubika.git
+rubpy
 pyzipper
