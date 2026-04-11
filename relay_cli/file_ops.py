@@ -6,6 +6,7 @@ import string
 from pathlib import Path
 
 import pyzipper
+from pyzipper.zipfile_aes import AESZipInfo
 
 from .config import MAX_PART_SIZE
 
@@ -36,6 +37,11 @@ def create_encrypted_zip(
     zip_path = output_dir / f"{archive_name}.zip"
     password = _random_string(16) if with_password else None
 
+    # Fixed timestamp so the archive hash depends only on file content.
+    entry_info = AESZipInfo(source_file.name, date_time=(2020, 1, 1, 0, 0, 0))
+    entry_info.compress_type = pyzipper.ZIP_DEFLATED
+    file_data = source_file.read_bytes()
+
     if password:
         with pyzipper.AESZipFile(
             zip_path, "w",
@@ -43,25 +49,29 @@ def create_encrypted_zip(
             encryption=pyzipper.WZ_AES,
         ) as zf:
             zf.setpassword(password.encode())
-            zf.write(source_file, source_file.name)
+            zf.writestr(entry_info, file_data)
     else:
         with pyzipper.AESZipFile(
             zip_path,
             "w",
             compression=pyzipper.ZIP_DEFLATED,
         ) as zf:
-            zf.write(source_file, source_file.name)
+            zf.writestr(entry_info, file_data)
 
     return zip_path, password
 
 
-def split_file(file_path: Path, max_size: int = MAX_PART_SIZE) -> list[Path]:
+def split_file(file_path: Path, max_size: int = MAX_PART_SIZE, *, part_stem: str | None = None) -> list[Path]:
     if max_size <= 0:
         raise ValueError("max_size must be a positive integer")
 
     file_size = file_path.stat().st_size
+    stem = part_stem or file_path.stem
+
     if file_size <= max_size:
-        return [file_path]
+        part_path = file_path.parent / f"{stem}.001"
+        file_path.rename(part_path)
+        return [part_path]
 
     # Keep part count constrained by max_size, then balance bytes across parts.
     part_count = (file_size + max_size - 1) // max_size
@@ -75,7 +85,7 @@ def split_file(file_path: Path, max_size: int = MAX_PART_SIZE) -> list[Path]:
             if not chunk:
                 break
             part_num += 1
-            part_path = file_path.parent / f"{file_path.stem}.part{part_num:02d}"
+            part_path = file_path.parent / f"{stem}.{part_num:03d}"
             part_path.write_bytes(chunk)
             parts.append(part_path)
 

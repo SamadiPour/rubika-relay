@@ -105,7 +105,7 @@ async def receive_relay_files(client: Client, output_dir: Path) -> list[dict]:
             continue
 
         file_inline = msg.file_inline
-        file_name = getattr(file_inline, "file_name", None) or f"{meta['original_name']}.part{meta['part']:02d}"
+        file_name = getattr(file_inline, "file_name", None) or f"{meta['original_name']}.{meta['part']:03d}"
         save_path = output_dir / file_name
 
         print(f"Downloading {file_name} (part {meta['part']}/{meta['total']})...")

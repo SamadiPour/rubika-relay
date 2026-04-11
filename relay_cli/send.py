@@ -149,10 +149,12 @@ def _load_or_prepare_state(
         state_dir,
         with_password=with_password,
     )
+    orig_suffix = file_path.suffix.lstrip(".")
+    part_stem = f"{zip_path.stem}.{orig_suffix}" if orig_suffix else zip_path.stem
     if chunk_size is not None:
-        parts = split_file(zip_path, max_size=chunk_size)
+        parts = split_file(zip_path, max_size=chunk_size, part_stem=part_stem)
     else:
-        parts = split_file(zip_path)
+        parts = split_file(zip_path, part_stem=part_stem)
     state = build_new_state(
         source_file=file_path,
         zip_name=zip_path.name,
