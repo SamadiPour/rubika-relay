@@ -57,11 +57,11 @@ async def _fetch_relay_messages(client: Client, limit_per_page: int = 50, max_pa
 
 
 async def _download_with_retry(
-        client: Client,
-        file_inline,
-        save_as: str,
-        progress: TransferProgress,
-        retries: int = MAX_RETRIES,
+    client: Client,
+    file_inline,
+    save_as: str,
+    progress: TransferProgress,
+    retries: int = MAX_RETRIES,
 ) -> str | None:
     for attempt in range(1, retries + 1):
         try:

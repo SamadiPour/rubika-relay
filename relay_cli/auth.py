@@ -31,9 +31,9 @@ def _normalize_phone(phone: str) -> str:
 
 
 async def login_with_persisted_session(
-        session_name: str,
-        session_dir: Path,
-        phone_number: Optional[str],
+    session_name: str,
+    session_dir: Path,
+    phone_number: Optional[str],
 ) -> Client:
     ensure_dir(session_dir)
     session_base = session_dir / session_name

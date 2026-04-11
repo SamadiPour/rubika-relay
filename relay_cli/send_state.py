@@ -80,10 +80,10 @@ def build_new_state(
 
 
 def state_matches_source(
-        state: dict[str, Any],
-        source_file: Path,
-        *,
-        expected_password_protected: bool | None = None,
+    state: dict[str, Any],
+    source_file: Path,
+    *,
+    expected_password_protected: bool | None = None,
 ) -> bool:
     if state.get("schema_version") != STATE_SCHEMA_VERSION:
         return False

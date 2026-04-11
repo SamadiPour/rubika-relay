@@ -26,10 +26,10 @@ def _random_string(length: int, alphabet: str = string.ascii_lowercase + string.
 
 
 def create_encrypted_zip(
-        source_file: Path,
-        output_dir: Path,
-        *,
-        with_password: bool = False,
+    source_file: Path,
+    output_dir: Path,
+    *,
+    with_password: bool = False,
 ) -> tuple[Path, str | None]:
     ensure_dir(output_dir)
     archive_name = _random_string(6)
@@ -38,17 +38,17 @@ def create_encrypted_zip(
 
     if password:
         with pyzipper.AESZipFile(
-                zip_path, "w",
-                compression=pyzipper.ZIP_DEFLATED,
-                encryption=pyzipper.WZ_AES,
+            zip_path, "w",
+            compression=pyzipper.ZIP_DEFLATED,
+            encryption=pyzipper.WZ_AES,
         ) as zf:
             zf.setpassword(password.encode())
             zf.write(source_file, source_file.name)
     else:
         with pyzipper.AESZipFile(
-                zip_path,
-                "w",
-                compression=pyzipper.ZIP_DEFLATED,
+            zip_path,
+            "w",
+            compression=pyzipper.ZIP_DEFLATED,
         ) as zf:
             zf.write(source_file, source_file.name)
 

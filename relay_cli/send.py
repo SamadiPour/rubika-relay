@@ -74,10 +74,10 @@ def _is_retryable_error(exc: Exception) -> bool:
 
 
 async def _send_with_retry(
-        client: Client,
-        file_path: Path,
-        caption: str,
-        retries: int = MAX_RETRIES,
+    client: Client,
+    file_path: Path,
+    caption: str,
+    retries: int = MAX_RETRIES,
 ) -> tuple[Update, int] | None:
     for attempt in range(1, retries + 1):
         progress = TransferProgress("  Upload")
@@ -132,9 +132,9 @@ def _load_or_prepare_state(
 
     state = load_state(state_dir)
     if state and state_matches_source(
-            state,
-            file_path,
-            expected_password_protected=with_password,
+        state,
+        file_path,
+        expected_password_protected=with_password,
     ) and resumable_parts_exist(state_dir, state):
         return state, True
 
