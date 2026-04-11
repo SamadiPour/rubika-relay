@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
 
 from rubpy import Client
 from rubpy import exceptions as rubpy_exceptions
@@ -20,25 +19,25 @@ AUTH_ERRORS = (
 
 
 def _normalize_phone(phone: str) -> str:
+    """Normalize and validate a phone number string, returning it in 98xxxxxxxxxx form."""
     stripped = "".join(ch for ch in phone if ch.isdigit())
     if stripped.startswith("0"):
-        return f"98{stripped[1:]}"
-    if stripped.startswith("98"):
-        return stripped
-    if stripped.startswith("9") and len(stripped) == 10:
-        return f"98{stripped}"
-    return stripped
-
-
-def _validate_phone(phone: str) -> None:
-    if len(phone) < 11:
+        result = f"98{stripped[1:]}"
+    elif stripped.startswith("98"):
+        result = stripped
+    elif stripped.startswith("9") and len(stripped) == 10:
+        result = f"98{stripped}"
+    else:
+        result = stripped
+    if len(result) < 11:
         raise CliError("Phone number format looks invalid.")
+    return result
 
 
 async def login_with_persisted_session(
     session_name: str,
     session_dir: Path,
-    phone_number: Optional[str],
+    phone_number: str | None,
 ) -> Client:
     ensure_dir(session_dir)
     session_base = session_dir / session_name
@@ -48,9 +47,6 @@ async def login_with_persisted_session(
     session_file = Path(f"{session_base}.rp")
     effective_phone = _normalize_phone(phone_number) if phone_number else None
 
-    if effective_phone:
-        _validate_phone(effective_phone)
-
     try:
         # If session exists, start() should reuse it and skip OTP.
         if session_file.exists():
@@ -59,7 +55,6 @@ async def login_with_persisted_session(
             if not effective_phone:
                 raw_phone = input("Phone number (e.g. 98xxxxxxxxxx): ").strip()
                 effective_phone = _normalize_phone(raw_phone)
-                _validate_phone(effective_phone)
             await client.start(phone_number=effective_phone)
 
         await _ensure_client_guid(client)
@@ -67,14 +62,14 @@ async def login_with_persisted_session(
         return client
 
     except AUTH_ERRORS as exc:
-        await _safe_disconnect(client)
+        await safe_disconnect(client)
         raise CliError(f"Authentication failed: {exc}") from exc
     except Exception as exc:
-        await _safe_disconnect(client)
+        await safe_disconnect(client)
         raise CliError(f"Unexpected login error: {exc}") from exc
 
 
-async def _safe_disconnect(client: Client) -> None:
+async def safe_disconnect(client: Client) -> None:
     try:
         await client.stop()
     except Exception:

@@ -7,7 +7,7 @@ import re
 import sys
 from pathlib import Path
 
-from relay_cli.auth import clear_local_session, login_with_persisted_session
+from relay_cli.auth import clear_local_session, login_with_persisted_session, safe_disconnect
 from relay_cli.errors import CliError
 from relay_cli.receive import receive_relay_files
 from relay_cli.send import send_relay_file
@@ -135,10 +135,7 @@ async def cmd_send(args: argparse.Namespace) -> int:
             print("Archive password: (none)")
         return 0
     finally:
-        try:
-            await client.stop()
-        except Exception:
-            pass
+        await safe_disconnect(client)
 
 
 async def cmd_receive(args: argparse.Namespace) -> int:
@@ -160,10 +157,7 @@ async def cmd_receive(args: argparse.Namespace) -> int:
             print(f"Done. {ok} file(s) verified, {failed} failed.")
         return 0
     finally:
-        try:
-            await client.stop()
-        except Exception:
-            pass
+        await safe_disconnect(client)
 
 
 async def cmd_logout(args: argparse.Namespace) -> int:

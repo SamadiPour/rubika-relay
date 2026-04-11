@@ -8,18 +8,12 @@ from pathlib import Path
 import pyzipper
 from pyzipper.zipfile_aes import AESZipInfo
 
-from .config import MAX_PART_SIZE
+from .config import FILE_CHUNK_SIZE, MAX_PART_SIZE
 
 
 def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
-
-def remove_file_safely(file_path: Path) -> None:
-    try:
-        file_path.unlink(missing_ok=True)
-    except OSError:
-        pass
 
 
 def _random_string(length: int, alphabet: str = string.ascii_lowercase + string.digits) -> str:
@@ -51,7 +45,7 @@ def create_encrypted_zip(
         # Stream the source file in 1 MB chunks to avoid loading it all into RAM.
         with zf.open(entry_info, "w", force_zip64=True) as dest:
             with source_file.open("rb") as src:
-                for chunk in iter(lambda: src.read(1024 * 1024), b""):
+                for chunk in iter(lambda: src.read(FILE_CHUNK_SIZE), b""):
                     dest.write(chunk)
 
     return zip_path, password
@@ -93,6 +87,6 @@ def split_file(file_path: Path, max_size: int = MAX_PART_SIZE, *, part_stem: str
 def sha256_hash(file_path: Path) -> str:
     h = hashlib.sha256()
     with file_path.open("rb") as fh:
-        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+        for chunk in iter(lambda: fh.read(FILE_CHUNK_SIZE), b""):
             h.update(chunk)
     return h.hexdigest()

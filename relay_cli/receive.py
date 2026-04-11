@@ -29,13 +29,9 @@ def _parse_caption(text: str):
     }
 
 
-async def _fetch_relay_messages(client: Client, limit_per_page: int = 50, max_pages: int = 4):
+async def _fetch_relay_messages(client: Client, object_guid: str, limit_per_page: int = 50, max_pages: int = 4):
     relay_msgs = []
     max_id = "0"
-    object_guid = str(getattr(client, "guid", "") or "")
-
-    if not object_guid:
-        raise CliError("Session is missing user GUID; cannot fetch Saved Messages.")
 
     for _ in range(max_pages):
         result = await client.get_messages(object_guid, max_id=max_id, limit=str(limit_per_page))
@@ -63,7 +59,7 @@ async def _download_with_retry(
     save_as: str,
     progress: TransferProgress,
     retries: int = MAX_RETRIES,
-) -> str | None:
+) -> str:
     for attempt in range(1, retries + 1):
         try:
             await client.download(file_inline, save_as=save_as, callback=progress.callback)
@@ -75,7 +71,7 @@ async def _download_with_retry(
             wait = 2 ** attempt + random.uniform(0.0, RETRY_JITTER_SECONDS)
             print(f"  Download failed (attempt {attempt}/{retries}), retrying in {wait:.1f}s... ({exc})")
             await asyncio.sleep(wait)
-    return None
+    raise CliError(f"Download failed after {retries} attempts.")
 
 
 async def receive_relay_files(client: Client, output_dir: Path) -> list[dict]:
@@ -87,7 +83,7 @@ async def receive_relay_files(client: Client, output_dir: Path) -> list[dict]:
         raise CliError("Session is missing user GUID; cannot access Saved Messages.")
 
     print("Fetching messages from Saved Messages...")
-    relay_msgs = await _fetch_relay_messages(client)
+    relay_msgs = await _fetch_relay_messages(client, object_guid)
 
     if not relay_msgs:
         print("No relay files found.")

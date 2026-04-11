@@ -52,23 +52,7 @@ def _is_retryable_error(exc: Exception) -> bool:
     if any(marker in text for marker in non_retryable_markers):
         return False
 
-    retryable_markers = (
-        "timeout",
-        "timed out",
-        "network",
-        "connection",
-        "temporar",
-        "reset",
-        "unavailable",
-        "try again",
-        "too many requests",
-        "429",
-        "flood",
-    )
-    if any(marker in text for marker in retryable_markers):
-        return True
-
-    # Unknown remote/upload errors are treated as transient by default.
+    # Treat all unknown remote/upload errors as transient by default.
     return True
 
 

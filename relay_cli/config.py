@@ -1,6 +1,7 @@
 """Relay configuration constants."""
 
 MAX_PART_SIZE = 100 * 1024 * 1024
+FILE_CHUNK_SIZE = 1024 * 1024  # 1 MB read buffer for hashing and streaming
 MAX_RETRIES = 5
 RETRY_BASE_DELAY_SECONDS = 2.0
 RETRY_MAX_DELAY_SECONDS = 30.0
