@@ -95,6 +95,11 @@ def parse_args() -> argparse.Namespace:
 
     recv_p = sub.add_parser("receive", help="Download relay files from Saved Messages.")
     recv_p.add_argument("--output-dir", type=Path, default=Path.cwd(), help="Directory to save files (default: CWD).")
+    recv_p.add_argument(
+        "--keep",
+        action="store_true",
+        help="Keep messages in Saved Messages after downloading (do not delete them).",
+    )
 
     sub.add_parser("logout", help="Clear local session file.")
 
@@ -149,7 +154,7 @@ async def cmd_receive(args: argparse.Namespace) -> int:
     )
 
     try:
-        results = await receive_relay_files(client, args.output_dir)
+        results = await receive_relay_files(client, args.output_dir, keep=args.keep)
         if results:
             ok = sum(1 for r in results if r["status"] == "ok")
             failed = len(results) - ok

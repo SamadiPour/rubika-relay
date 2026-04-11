@@ -74,7 +74,7 @@ async def _download_with_retry(
     raise CliError(f"Download failed after {retries} attempts.")
 
 
-async def receive_relay_files(client: Client, output_dir: Path) -> list[dict]:
+async def receive_relay_files(client: Client, output_dir: Path, *, keep: bool = False) -> list[dict]:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     object_guid = str(getattr(client, "guid", "") or "")
@@ -128,7 +128,7 @@ async def receive_relay_files(client: Client, output_dir: Path) -> list[dict]:
             "original_name": meta["original_name"],
         })
 
-    if delete_ids:
+    if delete_ids and not keep:
         print(f"Deleting {len(delete_ids)} verified message(s)...")
         try:
             await client.delete_messages(object_guid, message_ids=delete_ids, type="Global")
