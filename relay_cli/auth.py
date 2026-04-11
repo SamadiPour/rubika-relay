@@ -38,6 +38,7 @@ async def login_with_persisted_session(
     ensure_dir(session_dir)
     session_base = session_dir / session_name
     client = Client(name=str(session_base), display_welcome=False)
+    client.name = "Chrome"
 
     session_file = Path(f"{session_base}.rp")
     effective_phone = _normalize_phone(phone_number) if phone_number else None
