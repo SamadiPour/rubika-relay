@@ -56,15 +56,22 @@ def create_encrypted_zip(
 
 
 def split_file(file_path: Path, max_size: int = MAX_PART_SIZE) -> list[Path]:
+    if max_size <= 0:
+        raise ValueError("max_size must be a positive integer")
+
     file_size = file_path.stat().st_size
     if file_size <= max_size:
         return [file_path]
+
+    # Keep part count constrained by max_size, then balance bytes across parts.
+    part_count = (file_size + max_size - 1) // max_size
+    balanced_part_size = (file_size + part_count - 1) // part_count
 
     parts: list[Path] = []
     part_num = 0
     with file_path.open("rb") as fh:
         while True:
-            chunk = fh.read(max_size)
+            chunk = fh.read(balanced_part_size)
             if not chunk:
                 break
             part_num += 1
