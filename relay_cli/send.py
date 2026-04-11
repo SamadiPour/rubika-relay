@@ -19,7 +19,6 @@ from .config import (
 from .errors import CliError
 from .file_ops import (
     create_encrypted_zip,
-    remove_file_safely,
     sha256_hash,
     split_file,
 )
@@ -78,7 +77,7 @@ async def _send_with_retry(
     file_path: Path,
     caption: str,
     retries: int = MAX_RETRIES,
-) -> tuple[Update, int] | None:
+) -> tuple[Update, int]:
     for attempt in range(1, retries + 1):
         progress = TransferProgress("  Upload")
         try:
@@ -100,7 +99,6 @@ async def _send_with_retry(
             wait = base_wait + random.uniform(0.0, RETRY_JITTER_SECONDS)
             print(f"  Send failed (attempt {attempt}/{retries}), retrying in {wait:.1f}s... ({exc})")
             await asyncio.sleep(wait)
-    return None
 
 
 def _build_part_entries(parts: list[Path]) -> list[dict[str, Any]]:
@@ -207,9 +205,6 @@ async def send_relay_file(
         message_ids = [str(part.get("message_id") or "unknown") for part in parts]
         print("Upload already completed in local state. Cleaning up local state directory.")
         clear_state_dir(state_dir)
-        if file_path.suffix.lower() == ".zip":
-            remove_file_safely(file_path)
-            print(f"Source zip removed after successful send: {file_path.name}")
         return message_ids, password_value
 
     try:
@@ -253,10 +248,6 @@ async def send_relay_file(
 
         message_ids = [str(part.get("message_id") or "unknown") for part in parts]
         clear_state_dir(state_dir)
-
-        if file_path.suffix.lower() == ".zip":
-            remove_file_safely(file_path)
-            print(f"Source zip removed after successful send: {file_path.name}")
 
         return message_ids, password_value
 

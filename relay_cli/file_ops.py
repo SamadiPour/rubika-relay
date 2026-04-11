@@ -40,23 +40,19 @@ def create_encrypted_zip(
     # Fixed timestamp so the archive hash depends only on file content.
     entry_info = AESZipInfo(source_file.name, date_time=(2020, 1, 1, 0, 0, 0))
     entry_info.compress_type = pyzipper.ZIP_DEFLATED
-    file_data = source_file.read_bytes()
 
+    kwargs: dict = {"compression": pyzipper.ZIP_DEFLATED}
     if password:
-        with pyzipper.AESZipFile(
-            zip_path, "w",
-            compression=pyzipper.ZIP_DEFLATED,
-            encryption=pyzipper.WZ_AES,
-        ) as zf:
+        kwargs["encryption"] = pyzipper.WZ_AES
+
+    with pyzipper.AESZipFile(zip_path, "w", **kwargs) as zf:
+        if password:
             zf.setpassword(password.encode())
-            zf.writestr(entry_info, file_data)
-    else:
-        with pyzipper.AESZipFile(
-            zip_path,
-            "w",
-            compression=pyzipper.ZIP_DEFLATED,
-        ) as zf:
-            zf.writestr(entry_info, file_data)
+        # Stream the source file in 1 MB chunks to avoid loading it all into RAM.
+        with zf.open(entry_info, "w", force_zip64=True) as dest:
+            with source_file.open("rb") as src:
+                for chunk in iter(lambda: src.read(1024 * 1024), b""):
+                    dest.write(chunk)
 
     return zip_path, password
 
@@ -89,6 +85,8 @@ def split_file(file_path: Path, max_size: int = MAX_PART_SIZE, *, part_stem: str
             part_path.write_bytes(chunk)
             parts.append(part_path)
 
+    # All parts written successfully — remove the source to avoid doubled disk usage.
+    file_path.unlink()
     return parts
 
 

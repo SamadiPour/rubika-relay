@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import re
 from pathlib import Path
 
 from rubpy import Client
 
-from .config import MAX_RETRIES, RELAY_TAG
+from .config import MAX_RETRIES, RELAY_TAG, RETRY_JITTER_SECONDS
 from .errors import CliError
 from .file_ops import sha256_hash
 from .progress import TransferProgress
@@ -71,8 +72,8 @@ async def _download_with_retry(
             progress.finish()
             if attempt == retries:
                 raise CliError(f"Download failed after {retries} attempts: {exc}") from exc
-            wait = 2 ** attempt
-            print(f"  Download failed (attempt {attempt}/{retries}), retrying in {wait}s... ({exc})")
+            wait = 2 ** attempt + random.uniform(0.0, RETRY_JITTER_SECONDS)
+            print(f"  Download failed (attempt {attempt}/{retries}), retrying in {wait:.1f}s... ({exc})")
             await asyncio.sleep(wait)
     return None
 
@@ -105,7 +106,9 @@ async def receive_relay_files(client: Client, output_dir: Path) -> list[dict]:
             continue
 
         file_inline = msg.file_inline
-        file_name = getattr(file_inline, "file_name", None) or f"{meta['original_name']}.{meta['part']:03d}"
+        raw_name = getattr(file_inline, "file_name", None) or f"{meta['original_name']}.{meta['part']:03d}"
+        # Strip any directory components to prevent path-traversal attacks.
+        file_name = Path(raw_name).name or f"part_{meta['part']:03d}"
         save_path = output_dir / file_name
 
         print(f"Downloading {file_name} (part {meta['part']}/{meta['total']})...")

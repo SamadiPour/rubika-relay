@@ -30,6 +30,11 @@ def _normalize_phone(phone: str) -> str:
     return stripped
 
 
+def _validate_phone(phone: str) -> None:
+    if len(phone) < 11:
+        raise CliError("Phone number format looks invalid.")
+
+
 async def login_with_persisted_session(
     session_name: str,
     session_dir: Path,
@@ -43,8 +48,8 @@ async def login_with_persisted_session(
     session_file = Path(f"{session_base}.rp")
     effective_phone = _normalize_phone(phone_number) if phone_number else None
 
-    if effective_phone and len(effective_phone) < 11:
-        raise CliError("Phone number format looks invalid.")
+    if effective_phone:
+        _validate_phone(effective_phone)
 
     try:
         # If session exists, start() should reuse it and skip OTP.
@@ -54,6 +59,7 @@ async def login_with_persisted_session(
             if not effective_phone:
                 raw_phone = input("Phone number (e.g. 98xxxxxxxxxx): ").strip()
                 effective_phone = _normalize_phone(raw_phone)
+                _validate_phone(effective_phone)
             await client.start(phone_number=effective_phone)
 
         await _ensure_client_guid(client)

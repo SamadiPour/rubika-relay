@@ -106,8 +106,9 @@ def _session_dir_for(data_dir: Path) -> Path:
 
 
 async def cmd_send(args: argparse.Namespace) -> int:
-    if args.chunk_size is not None and args.chunk_size <= 0:
-        raise CliError("--chunk-size must be a positive value.")
+    file_path = args.file.expanduser().resolve()
+    if not file_path.is_file():
+        raise CliError(f"File not found: {file_path}")
 
     data_dir = resolve_data_dir(args.data_dir)
     session_dir = _session_dir_for(data_dir)
@@ -121,7 +122,7 @@ async def cmd_send(args: argparse.Namespace) -> int:
     try:
         message_ids, password = await send_relay_file(
             client,
-            args.file,
+            file_path,
             fresh=args.fresh,
             with_password=args.with_password,
             chunk_size=args.chunk_size,

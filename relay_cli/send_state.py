@@ -109,8 +109,9 @@ def state_matches_source(
         return False
 
     if expected_password_protected is not None:
-        archive_protected = bool(archive.get("protected"))
-        if "protected" not in archive:
+        if "protected" in archive:
+            archive_protected = bool(archive["protected"])
+        else:
             archive_protected = bool(archive.get("password"))
         if archive_protected != expected_password_protected:
             return False
