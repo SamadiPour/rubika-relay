@@ -17,7 +17,7 @@ _CAPTION_RE = re.compile(
 )
 
 
-def _parse_caption(text: str):
+def _parse_caption(text: str) -> dict | None:
     m = _CAPTION_RE.match(text)
     if not m:
         return None
@@ -29,7 +29,7 @@ def _parse_caption(text: str):
     }
 
 
-async def _fetch_relay_messages(client: Client, object_guid: str, limit_per_page: int = 50, max_pages: int = 4):
+async def _fetch_relay_messages(client: Client, object_guid: str, limit_per_page: int = 50, max_pages: int = 4) -> list:
     relay_msgs = []
     max_id = "0"
 
@@ -114,14 +114,19 @@ async def receive_relay_files(client: Client, output_dir: Path) -> list[dict]:
 
         actual_hash = sha256_hash(save_path)
         if actual_hash == meta["sha256"]:
-            print(f"  Hash verified OK")
+            print("  Hash verified OK")
             delete_ids.append(str(msg.message_id))
-            results.append({"file": file_name, "status": "ok", "part": meta["part"], "total": meta["total"],
-                            "original_name": meta["original_name"]})
+            status = "ok"
         else:
             print(f"  HASH MISMATCH! Expected {meta['sha256'][:16]}... got {actual_hash[:16]}...")
-            results.append({"file": file_name, "status": "hash_mismatch", "part": meta["part"], "total": meta["total"],
-                            "original_name": meta["original_name"]})
+            status = "hash_mismatch"
+        results.append({
+            "file": file_name,
+            "status": status,
+            "part": meta["part"],
+            "total": meta["total"],
+            "original_name": meta["original_name"],
+        })
 
     if delete_ids:
         print(f"Deleting {len(delete_ids)} verified message(s)...")

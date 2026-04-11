@@ -83,6 +83,7 @@ async def _send_with_retry(
             wait = base_wait + random.uniform(0.0, RETRY_JITTER_SECONDS)
             print(f"  Send failed (attempt {attempt}/{retries}), retrying in {wait:.1f}s... ({exc})")
             await asyncio.sleep(wait)
+    raise CliError(f"Failed to send {file_path.name} after {retries} attempts.")
 
 
 def _build_part_entries(parts: list[Path]) -> list[dict[str, Any]]:
@@ -133,10 +134,11 @@ def _load_or_prepare_state(
     )
     orig_suffix = file_path.suffix.lstrip(".")
     part_stem = f"{zip_path.stem}.{orig_suffix}" if orig_suffix else zip_path.stem
+    split_kwargs = {"part_stem": part_stem}
     if chunk_size is not None:
-        parts = split_file(zip_path, max_size=chunk_size, part_stem=part_stem)
-    else:
-        parts = split_file(zip_path, part_stem=part_stem)
+        split_kwargs["max_size"] = chunk_size
+
+    parts = split_file(zip_path, **split_kwargs)
     state = build_new_state(
         source_file=file_path,
         zip_name=zip_path.name,
