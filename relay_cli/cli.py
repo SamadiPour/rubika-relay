@@ -87,6 +87,11 @@ def parse_args() -> argparse.Namespace:
         metavar="SIZE",
         help="Override upload chunk size (examples: 104857600, 100mb, 1gb).",
     )
+    send_p.add_argument(
+        "--with-password",
+        action="store_true",
+        help="Protect the generated ZIP with a random password (disabled by default).",
+    )
 
     recv_p = sub.add_parser("receive", help="Download relay files from Saved Messages.")
     recv_p.add_argument("--output-dir", type=Path, default=Path.cwd(), help="Directory to save files (default: CWD).")
@@ -118,11 +123,15 @@ async def cmd_send(args: argparse.Namespace) -> int:
             client,
             args.file,
             fresh=args.fresh,
+            with_password=args.with_password,
             chunk_size=args.chunk_size,
         )
         print()
         print(f"Sent {len(message_ids)} part(s) to Saved Messages.")
-        print(f"Archive password: {password}")
+        if password:
+            print(f"Archive password: {password}")
+        else:
+            print("Archive password: (none)")
         return 0
     finally:
         try:

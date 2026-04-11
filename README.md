@@ -4,7 +4,7 @@ CLI for relaying files through your Rubika Saved Messages.
 
 It supports three operations:
 
-- `send`: zip + encrypt + split (if needed) + upload file parts.
+- `send`: zip + split (if needed) + upload file parts.
 - `receive`: download relay parts, verify SHA-256, and clean up verified messages.
 - `logout`: clear local session file.
 
@@ -14,7 +14,7 @@ It supports three operations:
 2. Persists session to disk and reuses it on later runs.
 3. When sending:
 
-- Creates an AES-encrypted zip archive.
+- Creates a zip archive.
 - Splits large archives into parts (100 MB per part by default, configurable with `--chunk-size`).
 - Sends each part to Saved Messages with caption metadata and SHA-256.
 - Persists upload state per file and resumes from the first unsent part on rerun.
@@ -45,8 +45,9 @@ python -m pip install -e .
 ```bash
 # Send a file
 rubika-relay send /absolute/or/relative/path/to/file.ext
-rubika-relay send --fresh /absolute/or/relative/path/to/file.ext
-rubika-relay send --chunk-size 10mb /absolute/or/relative/path/to/file.ext
+rubika-relay send --fresh file.ext
+rubika-relay send --chunk-size 10mb file.ext
+rubika-relay send --with-password file.ext
 
 # Receive relay files into a folder
 rubika-relay receive --output-dir ./downloads
@@ -60,16 +61,16 @@ rubika-relay logout
 - Default base directory: `~/.rubika-relay/`
 - Session files: `~/.rubika-relay/sessions/<session-name>.rp`
 - Per-file send state for uploads: `<source-file-name>.relay-state/` next to the source file
-  - Contains encrypted archive, split parts, and `send_state.json`
-  - Removed automatically after a full successful send
-  - Kept after interruptions/failures so reruns can resume
+    - Contains encrypted archive, split parts, and `send_state.json`
+    - Removed automatically after a full successful send
+    - Kept after interruptions/failures so reruns can resume
 
 If `--data-dir` or `RUBIKA_RELAY_DATA_DIR` is set, session paths are redirected there.
 Per-file send state remains next to the source file so resume data stays with that file.
 
 ## Notes
 
-- The archive password is printed after a successful `send`; keep it safe.
+- By default, sent archives are not password-protected.
 - If the session is valid, OTP is skipped automatically.
 - Resume currently works at part level. If a transient error happens mid-part, only that same part is retried.
 - `--chunk-size` accepts bytes or units like `10kb`, `10mb`, `10gb`.

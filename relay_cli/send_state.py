@@ -56,10 +56,10 @@ def clear_state_dir(state_dir: Path) -> None:
 
 
 def build_new_state(
-        source_file: Path,
-        zip_name: str,
-        password: str,
-        part_entries: list[dict[str, Any]],
+    source_file: Path,
+    zip_name: str,
+    password: str | None,
+    part_entries: list[dict[str, Any]],
 ) -> dict[str, Any]:
     now = time.time()
     return {
@@ -71,6 +71,7 @@ def build_new_state(
         "archive": {
             "name": zip_name,
             "password": password,
+            "protected": bool(password),
         },
         "total_parts": len(part_entries),
         "parts": part_entries,
@@ -78,7 +79,12 @@ def build_new_state(
     }
 
 
-def state_matches_source(state: dict[str, Any], source_file: Path) -> bool:
+def state_matches_source(
+        state: dict[str, Any],
+        source_file: Path,
+        *,
+        expected_password_protected: bool | None = None,
+) -> bool:
     if state.get("schema_version") != STATE_SCHEMA_VERSION:
         return False
 
@@ -99,8 +105,15 @@ def state_matches_source(state: dict[str, Any], source_file: Path) -> bool:
         return False
 
     archive = state.get("archive")
-    if not isinstance(archive, dict) or not archive.get("password"):
+    if not isinstance(archive, dict):
         return False
+
+    if expected_password_protected is not None:
+        archive_protected = bool(archive.get("protected"))
+        if "protected" not in archive:
+            archive_protected = bool(archive.get("password"))
+        if archive_protected != expected_password_protected:
+            return False
 
     return True
 

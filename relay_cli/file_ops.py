@@ -25,19 +25,32 @@ def _random_string(length: int, alphabet: str = string.ascii_lowercase + string.
     return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
-def create_encrypted_zip(source_file: Path, output_dir: Path) -> tuple[Path, str]:
+def create_encrypted_zip(
+        source_file: Path,
+        output_dir: Path,
+        *,
+        with_password: bool = False,
+) -> tuple[Path, str | None]:
     ensure_dir(output_dir)
     archive_name = _random_string(6)
     zip_path = output_dir / f"{archive_name}.zip"
-    password = _random_string(16)
+    password = _random_string(16) if with_password else None
 
-    with pyzipper.AESZipFile(
-            zip_path, "w",
-            compression=pyzipper.ZIP_DEFLATED,
-            encryption=pyzipper.WZ_AES,
-    ) as zf:
-        zf.setpassword(password.encode())
-        zf.write(source_file, source_file.name)
+    if password:
+        with pyzipper.AESZipFile(
+                zip_path, "w",
+                compression=pyzipper.ZIP_DEFLATED,
+                encryption=pyzipper.WZ_AES,
+        ) as zf:
+            zf.setpassword(password.encode())
+            zf.write(source_file, source_file.name)
+    else:
+        with pyzipper.AESZipFile(
+                zip_path,
+                "w",
+                compression=pyzipper.ZIP_DEFLATED,
+        ) as zf:
+            zf.write(source_file, source_file.name)
 
     return zip_path, password
 

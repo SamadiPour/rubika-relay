@@ -121,16 +121,21 @@ def _build_part_entries(parts: list[Path]) -> list[dict[str, Any]]:
 
 
 def _load_or_prepare_state(
-        file_path: Path,
-        state_dir: Path,
-        fresh: bool,
-        chunk_size: int | None = None,
+    file_path: Path,
+    state_dir: Path,
+    fresh: bool,
+    with_password: bool,
+    chunk_size: int | None = None,
 ) -> tuple[dict[str, Any], bool]:
     if fresh:
         clear_state_dir(state_dir)
 
     state = load_state(state_dir)
-    if state and state_matches_source(state, file_path) and resumable_parts_exist(state_dir, state):
+    if state and state_matches_source(
+            state,
+            file_path,
+            expected_password_protected=with_password,
+    ) and resumable_parts_exist(state_dir, state):
         return state, True
 
     if state:
@@ -139,7 +144,11 @@ def _load_or_prepare_state(
 
     state_dir.mkdir(parents=True, exist_ok=True)
     print(f"Zipping {file_path.name}...")
-    zip_path, password = create_encrypted_zip(file_path, state_dir)
+    zip_path, password = create_encrypted_zip(
+        file_path,
+        state_dir,
+        with_password=with_password,
+    )
     if chunk_size is not None:
         parts = split_file(zip_path, max_size=chunk_size)
     else:
@@ -155,15 +164,16 @@ def _load_or_prepare_state(
 
 
 async def send_relay_file(
-        client: Client,
-        file_path: Path,
-        *,
-        fresh: bool = False,
-        chunk_size: int | None = None,
-) -> tuple[list[str], str]:
+    client: Client,
+    file_path: Path,
+    *,
+    fresh: bool = False,
+    with_password: bool = False,
+    chunk_size: int | None = None,
+) -> tuple[list[str], str | None]:
     """Zip, split, hash, and send a file to Saved Messages.
 
-    Returns (list_of_message_ids, zip_password).
+    Returns (list_of_message_ids, zip_password_or_none).
     """
     if not file_path.is_file():
         raise CliError(f"File not found: {file_path}")
@@ -175,12 +185,12 @@ async def send_relay_file(
         file_path,
         state_dir,
         fresh=fresh,
+        with_password=with_password,
         chunk_size=chunk_size,
     )
     original_name = state.get("source", {}).get("name", file_path.name)
     password = state.get("archive", {}).get("password")
-    if not password:
-        raise CliError("Missing archive password in send state.")
+    password_value = str(password) if password else None
 
     parts = state.get("parts") or []
     total = len(parts)
@@ -198,7 +208,7 @@ async def send_relay_file(
         if file_path.suffix.lower() == ".zip":
             remove_file_safely(file_path)
             print(f"Source zip removed after successful send: {file_path.name}")
-        return message_ids, str(password)
+        return message_ids, password_value
 
     try:
         for part in parts[start_idx - 1:]:
@@ -246,7 +256,7 @@ async def send_relay_file(
             remove_file_safely(file_path)
             print(f"Source zip removed after successful send: {file_path.name}")
 
-        return message_ids, str(password)
+        return message_ids, password_value
 
     except Exception as exc:
         state["status"] = "interrupted"
