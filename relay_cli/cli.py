@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -12,6 +13,15 @@ from relay_cli.receive import receive_relay_files
 from relay_cli.send import send_relay_file
 
 ENV_DATA_DIR = "RUBIKA_RELAY_DATA_DIR"
+
+_CHUNK_SIZE_MULTIPLIERS = {
+    "k": 1024,
+    "kb": 1024,
+    "m": 1024 * 1024,
+    "mb": 1024 * 1024,
+    "g": 1024 * 1024 * 1024,
+    "gb": 1024 * 1024 * 1024,
+}
 
 
 def default_data_dir() -> Path:
@@ -28,6 +38,23 @@ def resolve_data_dir(arg_data_dir: Path | None) -> Path:
         return Path(env_data_dir).expanduser().resolve()
 
     return default_data_dir().resolve()
+
+
+def parse_chunk_size(value: str) -> int:
+    raw = value.strip().lower()
+    match = re.fullmatch(r"(\d+)\s*([kmg]b?)?", raw)
+    if not match:
+        raise argparse.ArgumentTypeError(
+            "Invalid chunk size. Use bytes or units like 10kb, 10mb, 10gb."
+        )
+
+    amount = int(match.group(1))
+    if amount <= 0:
+        raise argparse.ArgumentTypeError("Chunk size must be a positive number.")
+
+    unit = match.group(2)
+    multiplier = _CHUNK_SIZE_MULTIPLIERS.get(unit, 1)
+    return amount * multiplier
 
 
 def parse_args() -> argparse.Namespace:
@@ -53,6 +80,13 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Ignore existing local send state and start upload preparation from scratch.",
     )
+    send_p.add_argument(
+        "--chunk-size",
+        type=parse_chunk_size,
+        default=None,
+        metavar="SIZE",
+        help="Override upload chunk size (examples: 104857600, 100mb, 1gb).",
+    )
 
     recv_p = sub.add_parser("receive", help="Download relay files from Saved Messages.")
     recv_p.add_argument("--output-dir", type=Path, default=Path.cwd(), help="Directory to save files (default: CWD).")
@@ -67,6 +101,9 @@ def _session_dir_for(data_dir: Path) -> Path:
 
 
 async def cmd_send(args: argparse.Namespace) -> int:
+    if args.chunk_size is not None and args.chunk_size <= 0:
+        raise CliError("--chunk-size must be a positive value.")
+
     data_dir = resolve_data_dir(args.data_dir)
     session_dir = _session_dir_for(data_dir)
 
@@ -75,10 +112,14 @@ async def cmd_send(args: argparse.Namespace) -> int:
         session_dir=session_dir,
         phone_number=args.phone,
     )
-    print("Session ready.")
 
     try:
-        message_ids, password = await send_relay_file(client, args.file, fresh=args.fresh)
+        message_ids, password = await send_relay_file(
+            client,
+            args.file,
+            fresh=args.fresh,
+            chunk_size=args.chunk_size,
+        )
         print()
         print(f"Sent {len(message_ids)} part(s) to Saved Messages.")
         print(f"Archive password: {password}")
@@ -99,7 +140,6 @@ async def cmd_receive(args: argparse.Namespace) -> int:
         session_dir=session_dir,
         phone_number=args.phone,
     )
-    print("Session ready.")
 
     try:
         results = await receive_relay_files(client, args.output_dir)

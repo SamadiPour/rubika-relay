@@ -120,7 +120,12 @@ def _build_part_entries(parts: list[Path]) -> list[dict[str, Any]]:
     return entries
 
 
-def _load_or_prepare_state(file_path: Path, state_dir: Path, fresh: bool) -> tuple[dict[str, Any], bool]:
+def _load_or_prepare_state(
+        file_path: Path,
+        state_dir: Path,
+        fresh: bool,
+        chunk_size: int | None = None,
+) -> tuple[dict[str, Any], bool]:
     if fresh:
         clear_state_dir(state_dir)
 
@@ -135,7 +140,10 @@ def _load_or_prepare_state(file_path: Path, state_dir: Path, fresh: bool) -> tup
     state_dir.mkdir(parents=True, exist_ok=True)
     print(f"Zipping {file_path.name}...")
     zip_path, password = create_encrypted_zip(file_path, state_dir)
-    parts = split_file(zip_path)
+    if chunk_size is not None:
+        parts = split_file(zip_path, max_size=chunk_size)
+    else:
+        parts = split_file(zip_path)
     state = build_new_state(
         source_file=file_path,
         zip_name=zip_path.name,
@@ -151,6 +159,7 @@ async def send_relay_file(
         file_path: Path,
         *,
         fresh: bool = False,
+        chunk_size: int | None = None,
 ) -> tuple[list[str], str]:
     """Zip, split, hash, and send a file to Saved Messages.
 
@@ -158,9 +167,16 @@ async def send_relay_file(
     """
     if not file_path.is_file():
         raise CliError(f"File not found: {file_path}")
+    if chunk_size is not None and chunk_size <= 0:
+        raise CliError("chunk_size must be a positive integer (bytes).")
 
     state_dir = state_dir_for_source(file_path)
-    state, resumed = _load_or_prepare_state(file_path, state_dir, fresh=fresh)
+    state, resumed = _load_or_prepare_state(
+        file_path,
+        state_dir,
+        fresh=fresh,
+        chunk_size=chunk_size,
+    )
     original_name = state.get("source", {}).get("name", file_path.name)
     password = state.get("archive", {}).get("password")
     if not password:

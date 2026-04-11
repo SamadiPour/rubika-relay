@@ -15,7 +15,7 @@ It supports three operations:
 3. When sending:
 
 - Creates an AES-encrypted zip archive.
-- Splits large archives into parts (100 MB per part).
+- Splits large archives into parts (100 MB per part by default, configurable with `--chunk-size`).
 - Sends each part to Saved Messages with caption metadata and SHA-256.
 - Persists upload state per file and resumes from the first unsent part on rerun.
 
@@ -45,9 +45,8 @@ python -m pip install -e .
 ```bash
 # Send a file
 rubika-relay send /absolute/or/relative/path/to/file.ext
-
-# Force a fresh upload state (ignore resume state)
 rubika-relay send --fresh /absolute/or/relative/path/to/file.ext
+rubika-relay send --chunk-size 10mb /absolute/or/relative/path/to/file.ext
 
 # Receive relay files into a folder
 rubika-relay receive --output-dir ./downloads
@@ -73,3 +72,4 @@ Per-file send state remains next to the source file so resume data stays with th
 - The archive password is printed after a successful `send`; keep it safe.
 - If the session is valid, OTP is skipped automatically.
 - Resume currently works at part level. If a transient error happens mid-part, only that same part is retried.
+- `--chunk-size` accepts bytes or units like `10kb`, `10mb`, `10gb`.
