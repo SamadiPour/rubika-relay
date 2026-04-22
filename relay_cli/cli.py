@@ -14,6 +14,7 @@ from relay_cli.receive import receive_relay_files
 from relay_cli.send import send_relay_file
 
 ENV_DATA_DIR = "RUBIKA_RELAY_DATA_DIR"
+ENV_PROXY = "RUBIKA_RELAY_PROXY"
 
 _CHUNK_SIZE_MULTIPLIERS = {
     "k": 1024,
@@ -39,6 +40,19 @@ def resolve_data_dir(arg_data_dir: Path | None) -> Path:
         return Path(env_data_dir).expanduser().resolve()
 
     return default_data_dir().resolve()
+
+
+def resolve_proxy(arg_proxy: str | None) -> str | None:
+    if arg_proxy is not None:
+        value = arg_proxy.strip()
+        return value or None
+
+    env_proxy = os.getenv(ENV_PROXY)
+    if env_proxy:
+        value = env_proxy.strip()
+        return value or None
+
+    return None
 
 
 def parse_chunk_size(value: str) -> int:
@@ -69,6 +83,16 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Base directory for session storage. "
             f"Defaults to ${ENV_DATA_DIR} or {default_data_dir()}."
+        ),
+    )
+    parser.add_argument(
+        "--proxy",
+        default=None,
+        metavar="URL",
+        help=(
+            "Optional HTTP(S)/SOCKS proxy URL for all Rubika traffic "
+            "(e.g. http://127.0.0.1:8080, socks5://127.0.0.1:1080). "
+            f"Falls back to ${ENV_PROXY} when unset."
         ),
     )
 
@@ -145,11 +169,15 @@ def _session_dir_for(data_dir: Path) -> Path:
 async def cmd_send(args: argparse.Namespace) -> int:
     data_dir = resolve_data_dir(args.data_dir)
     session_dir = _session_dir_for(data_dir)
+    proxy = resolve_proxy(args.proxy)
+    if proxy:
+        print(f"Using proxy: {proxy}")
 
     client = await login_with_persisted_session(
         session_name=args.session_name,
         session_dir=session_dir,
         phone_number=args.phone,
+        proxy=proxy,
     )
 
     try:
@@ -181,10 +209,15 @@ async def cmd_receive(args: argparse.Namespace) -> int:
         else Path.cwd().resolve()
     )
 
+    proxy = resolve_proxy(args.proxy)
+    if proxy:
+        print(f"Using proxy: {proxy}")
+
     client = await login_with_persisted_session(
         session_name=args.session_name,
         session_dir=session_dir,
         phone_number=args.phone,
+        proxy=proxy,
     )
 
     try:

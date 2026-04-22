@@ -38,10 +38,15 @@ async def login_with_persisted_session(
     session_name: str,
     session_dir: Path,
     phone_number: str | None,
+    *,
+    proxy: str | None = None,
 ) -> Client:
     ensure_dir(session_dir)
     session_base = session_dir / session_name
-    client = Client(name=str(session_base), display_welcome=False)
+    client_kwargs: dict[str, object] = {"name": str(session_base), "display_welcome": False}
+    if proxy:
+        client_kwargs["proxy"] = proxy
+    client = Client(**client_kwargs)
     client.name = "Chrome"
 
     session_file = Path(f"{session_base}.rp")
