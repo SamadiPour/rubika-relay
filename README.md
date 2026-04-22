@@ -52,7 +52,7 @@ rubika-relay send --fresh file.ext
 rubika-relay send --chunk-size 10mb file.ext
 rubika-relay send --with-password file.ext
 
-# Receive relay files into the default download directory (<data-dir>/downloads)
+# Receive relay files into the current working directory
 rubika-relay receive
 
 # Or receive relay files into a specific folder
@@ -66,7 +66,7 @@ rubika-relay logout
 
 - Default base directory: `~/.rubika-relay/`
 - Session files: `~/.rubika-relay/sessions/<session-name>.rp`
-- Default download directory: `~/.rubika-relay/downloads/`
+- Default receive output directory: current working directory
 - Per-file send state for uploads: `<source-file-name>.relay-state/` next to the source file
     - Contains encrypted archive, split parts, and `send_state.json`
     - Removed automatically after a full successful send

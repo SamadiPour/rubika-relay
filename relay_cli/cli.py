@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 from relay_cli.auth import clear_local_session, login_with_persisted_session, safe_disconnect
-from relay_cli.config import DEFAULT_DOWNLOAD_DIRNAME, MAX_PART_SIZE
+from relay_cli.config import MAX_PART_SIZE
 from relay_cli.errors import CliError
 from relay_cli.receive import receive_relay_files
 from relay_cli.send import send_relay_file
@@ -39,10 +39,6 @@ def resolve_data_dir(arg_data_dir: Path | None) -> Path:
         return Path(env_data_dir).expanduser().resolve()
 
     return default_data_dir().resolve()
-
-
-def default_download_dir(data_dir: Path) -> Path:
-    return data_dir / DEFAULT_DOWNLOAD_DIRNAME
 
 
 def parse_chunk_size(value: str) -> int:
@@ -108,7 +104,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Directory to save restored files "
-            f"(default: <data-dir>/{DEFAULT_DOWNLOAD_DIRNAME})."
+            "(default: current working directory)."
         ),
     )
     recv_p.add_argument(
@@ -162,7 +158,7 @@ async def cmd_receive(args: argparse.Namespace) -> int:
     output_dir = (
         args.output_dir.expanduser().resolve()
         if args.output_dir is not None
-        else default_download_dir(data_dir).resolve()
+        else Path.cwd().resolve()
     )
 
     client = await login_with_persisted_session(
