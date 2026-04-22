@@ -3,11 +3,15 @@ from __future__ import annotations
 import asyncio
 import random
 import re
+import shutil
+import tempfile
 from pathlib import Path
+from typing import Any
 
+import pyzipper
 from rubpy import Client
 
-from .config import MAX_RETRIES, RELAY_TAG, RETRY_JITTER_SECONDS
+from .config import FILE_CHUNK_SIZE, MAX_RETRIES, RELAY_TAG, RETRY_JITTER_SECONDS
 from .errors import CliError
 from .file_ops import sha256_hash
 from .progress import TransferProgress
@@ -27,6 +31,49 @@ def _parse_caption(text: str) -> dict | None:
         "total": int(m.group(3)),
         "sha256": m.group(4),
     }
+
+
+def _safe_file_name(name: str) -> str:
+    cleaned = Path(name).name.strip()
+    return cleaned or "restored_file"
+
+
+def _unique_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+
+    stem = path.stem
+    suffix = path.suffix
+    for i in range(1, 1000):
+        candidate = path.with_name(f"{stem} ({i}){suffix}")
+        if not candidate.exists():
+            return candidate
+    raise CliError(f"Could not find a unique output name for: {path.name}")
+
+
+def _assemble_parts(part_paths: list[Path], archive_path: Path) -> None:
+    with archive_path.open("wb") as out:
+        for part_path in part_paths:
+            with part_path.open("rb") as src:
+                for chunk in iter(lambda: src.read(FILE_CHUNK_SIZE), b""):
+                    out.write(chunk)
+
+
+def _extract_archive_to_original_name(archive_path: Path, output_dir: Path, original_name: str) -> Path:
+    target_path = _unique_path(output_dir / _safe_file_name(original_name))
+
+    with pyzipper.AESZipFile(archive_path, "r") as zf:
+        entries = [entry for entry in zf.infolist() if not entry.is_dir()]
+        if not entries:
+            raise CliError("Archive is empty; nothing to extract.")
+
+        # Sender writes one file per archive; extracting the first file is sufficient.
+        first_entry = entries[0]
+        with zf.open(first_entry, "r") as src, target_path.open("wb") as dest:
+            for chunk in iter(lambda: src.read(FILE_CHUNK_SIZE), b""):
+                dest.write(chunk)
+
+    return target_path
 
 
 async def _fetch_relay_messages(client: Client, object_guid: str, limit_per_page: int = 50, max_pages: int = 4) -> list:
@@ -94,6 +141,7 @@ async def receive_relay_files(client: Client, output_dir: Path, *, keep: bool = 
     results = []
     delete_ids = []
 
+    grouped: dict[tuple[str, int], dict[int, tuple[Any, dict[str, Any]]]] = {}
     for msg in relay_msgs:
         text = getattr(msg, "text", "") or ""
         meta = _parse_caption(text)
@@ -101,32 +149,96 @@ async def receive_relay_files(client: Client, output_dir: Path, *, keep: bool = 
             print(f"  Skipping message with unparseable caption: {text[:60]}")
             continue
 
-        file_inline = msg.file_inline
-        raw_name = getattr(file_inline, "file_name", None) or f"{meta['original_name']}.{meta['part']:03d}"
-        # Strip any directory components to prevent path-traversal attacks.
-        file_name = Path(raw_name).name or f"part_{meta['part']:03d}"
-        save_path = output_dir / file_name
+        total = int(meta["total"])
+        part = int(meta["part"])
+        if part < 1 or total < 1 or part > total:
+            print(f"  Skipping invalid relay metadata: part={part}, total={total}")
+            continue
 
-        print(f"Downloading {file_name} (part {meta['part']}/{meta['total']})...")
-        progress = TransferProgress("  Download")
-        await _download_with_retry(client, file_inline, str(save_path), progress)
-        progress.finish()
+        key = (str(meta["original_name"]), total)
+        per_part = grouped.setdefault(key, {})
+        # Keep the first occurrence (newest message page order) when duplicates exist.
+        if part not in per_part:
+            per_part[part] = (msg, meta)
 
-        actual_hash = sha256_hash(save_path)
-        if actual_hash == meta["sha256"]:
-            print("  Hash verified OK")
-            delete_ids.append(str(msg.message_id))
-            status = "ok"
-        else:
-            print(f"  HASH MISMATCH! Expected {meta['sha256'][:16]}... got {actual_hash[:16]}...")
-            status = "hash_mismatch"
-        results.append({
-            "file": file_name,
-            "status": status,
-            "part": meta["part"],
-            "total": meta["total"],
-            "original_name": meta["original_name"],
-        })
+    for (original_name, total), part_map in grouped.items():
+        missing = [idx for idx in range(1, total + 1) if idx not in part_map]
+        if missing:
+            print(
+                f"Skipping {original_name}: missing {len(missing)} part(s) "
+                f"({', '.join(str(x) for x in missing[:10])}{'...' if len(missing) > 10 else ''})."
+            )
+            results.append(
+                {
+                    "file": _safe_file_name(original_name),
+                    "status": "missing_parts",
+                    "part": 0,
+                    "total": total,
+                    "original_name": original_name,
+                }
+            )
+            continue
+
+        work_dir = Path(tempfile.mkdtemp(prefix="relay_parts_", dir=str(output_dir)))
+        group_message_ids: list[str] = []
+        part_paths: list[Path] = []
+        status = "ok"
+        restored_name = _safe_file_name(original_name)
+
+        try:
+            for idx in range(1, total + 1):
+                msg, meta = part_map[idx]
+                group_message_ids.append(str(msg.message_id))
+
+                file_inline = msg.file_inline
+                raw_name = getattr(file_inline, "file_name", None) or f"{original_name}.{idx:03d}"
+                file_name = Path(raw_name).name or f"part_{idx:03d}"
+                save_path = work_dir / f"{idx:03d}_{file_name}"
+
+                print(f"Downloading {file_name} (part {idx}/{total})...")
+                progress = TransferProgress("  Download")
+                await _download_with_retry(client, file_inline, str(save_path), progress)
+                progress.finish()
+
+                actual_hash = sha256_hash(save_path)
+                if actual_hash != meta["sha256"]:
+                    print(f"  HASH MISMATCH! Expected {meta['sha256'][:16]}... got {actual_hash[:16]}...")
+                    status = "hash_mismatch"
+                    break
+
+                print("  Hash verified OK")
+                part_paths.append(save_path)
+
+            if status == "ok":
+                archive_path = work_dir / "relay_archive.zip"
+                _assemble_parts(part_paths, archive_path)
+
+                restored_path = _extract_archive_to_original_name(
+                    archive_path=archive_path,
+                    output_dir=output_dir,
+                    original_name=original_name,
+                )
+                restored_name = restored_path.name
+                print(f"Restored: {restored_name}")
+                delete_ids.extend(group_message_ids)
+
+        except CliError:
+            raise
+        except Exception as exc:
+            status = "extract_failed"
+            print(f"  Failed to restore {original_name}: {exc}")
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
+
+        results.append(
+            {
+                "file": restored_name,
+                "status": status,
+                "part": total if status == "ok" else 0,
+                "total": total,
+                "original_name": original_name,
+            }
+        )
 
     if delete_ids and not keep:
         print(f"Deleting {len(delete_ids)} verified message(s)...")

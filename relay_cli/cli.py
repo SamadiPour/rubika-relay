@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from relay_cli.auth import clear_local_session, login_with_persisted_session, safe_disconnect
+from relay_cli.config import DEFAULT_DOWNLOAD_DIRNAME, MAX_PART_SIZE
 from relay_cli.errors import CliError
 from relay_cli.receive import receive_relay_files
 from relay_cli.send import send_relay_file
@@ -38,6 +39,10 @@ def resolve_data_dir(arg_data_dir: Path | None) -> Path:
         return Path(env_data_dir).expanduser().resolve()
 
     return default_data_dir().resolve()
+
+
+def default_download_dir(data_dir: Path) -> Path:
+    return data_dir / DEFAULT_DOWNLOAD_DIRNAME
 
 
 def parse_chunk_size(value: str) -> int:
@@ -74,7 +79,7 @@ def parse_args() -> argparse.Namespace:
     sub = parser.add_subparsers(dest="command", required=True)
 
     send_p = sub.add_parser("send", help="Send a file to Saved Messages.")
-    send_p.add_argument("file", type=Path, help="Path to the file to send.")
+    send_p.add_argument("file", help="Path to the file to send, or a full direct http(s) URL.")
     send_p.add_argument(
         "--fresh",
         action="store_true",
@@ -85,7 +90,10 @@ def parse_args() -> argparse.Namespace:
         type=parse_chunk_size,
         default=None,
         metavar="SIZE",
-        help="Override upload chunk size (examples: 104857600, 100mb, 1gb).",
+        help=(
+            "Override upload chunk size (examples: 104857600, 100mb, 1gb). "
+            f"Default is {MAX_PART_SIZE // (1024 * 1024)}mb."
+        ),
     )
     send_p.add_argument(
         "--with-password",
@@ -94,7 +102,15 @@ def parse_args() -> argparse.Namespace:
     )
 
     recv_p = sub.add_parser("receive", help="Download relay files from Saved Messages.")
-    recv_p.add_argument("--output-dir", type=Path, default=Path.cwd(), help="Directory to save files (default: CWD).")
+    recv_p.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory to save restored files "
+            f"(default: <data-dir>/{DEFAULT_DOWNLOAD_DIRNAME})."
+        ),
+    )
     recv_p.add_argument(
         "--keep",
         action="store_true",
@@ -111,10 +127,6 @@ def _session_dir_for(data_dir: Path) -> Path:
 
 
 async def cmd_send(args: argparse.Namespace) -> int:
-    file_path = args.file.expanduser().resolve()
-    if not file_path.is_file():
-        raise CliError(f"File not found: {file_path}")
-
     data_dir = resolve_data_dir(args.data_dir)
     session_dir = _session_dir_for(data_dir)
 
@@ -127,10 +139,11 @@ async def cmd_send(args: argparse.Namespace) -> int:
     try:
         message_ids, password = await send_relay_file(
             client,
-            file_path,
+            args.file,
             fresh=args.fresh,
             with_password=args.with_password,
             chunk_size=args.chunk_size,
+            data_dir=data_dir,
         )
         print()
         print(f"Sent {len(message_ids)} part(s) to Saved Messages.")
@@ -146,6 +159,11 @@ async def cmd_send(args: argparse.Namespace) -> int:
 async def cmd_receive(args: argparse.Namespace) -> int:
     data_dir = resolve_data_dir(args.data_dir)
     session_dir = _session_dir_for(data_dir)
+    output_dir = (
+        args.output_dir.expanduser().resolve()
+        if args.output_dir is not None
+        else default_download_dir(data_dir).resolve()
+    )
 
     client = await login_with_persisted_session(
         session_name=args.session_name,
@@ -154,7 +172,7 @@ async def cmd_receive(args: argparse.Namespace) -> int:
     )
 
     try:
-        results = await receive_relay_files(client, args.output_dir, keep=args.keep)
+        results = await receive_relay_files(client, output_dir, keep=args.keep)
         if results:
             ok = sum(1 for r in results if r["status"] == "ok")
             failed = len(results) - ok
