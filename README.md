@@ -80,5 +80,5 @@ Per-file send state remains next to the source file so resume data stays with th
 - By default, sent archives are not password-protected.
 - If the session is valid, OTP is skipped automatically.
 - Resume currently works at part level. If a transient error happens mid-part, only that same part is retried.
-- Default upload chunk size is 500 MB.
+- Default upload chunk size is 100 MB.
 - `--chunk-size` accepts bytes or units like `10kb`, `10mb`, `10gb`.
