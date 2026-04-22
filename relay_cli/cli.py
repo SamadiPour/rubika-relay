@@ -8,11 +8,13 @@ import sys
 from pathlib import Path
 
 from relay_cli.auth import clear_local_session, login_with_persisted_session, safe_disconnect
+from relay_cli.config import MAX_PART_SIZE, MAX_PARALLEL_DOWNLOADS, MAX_PARALLEL_UPLOADS
 from relay_cli.errors import CliError
-from relay_cli.receive import receive_relay_files
+from relay_cli.receive import list_relay_files, receive_relay_files
 from relay_cli.send import send_relay_file
 
 ENV_DATA_DIR = "RUBIKA_RELAY_DATA_DIR"
+ENV_PROXY = "RUBIKA_RELAY_PROXY"
 
 _CHUNK_SIZE_MULTIPLIERS = {
     "k": 1024,
@@ -38,6 +40,19 @@ def resolve_data_dir(arg_data_dir: Path | None) -> Path:
         return Path(env_data_dir).expanduser().resolve()
 
     return default_data_dir().resolve()
+
+
+def resolve_proxy(arg_proxy: str | None) -> str | None:
+    if arg_proxy is not None:
+        value = arg_proxy.strip()
+        return value or None
+
+    env_proxy = os.getenv(ENV_PROXY)
+    if env_proxy:
+        value = env_proxy.strip()
+        return value or None
+
+    return None
 
 
 def parse_chunk_size(value: str) -> int:
@@ -70,11 +85,21 @@ def parse_args() -> argparse.Namespace:
             f"Defaults to ${ENV_DATA_DIR} or {default_data_dir()}."
         ),
     )
+    parser.add_argument(
+        "--proxy",
+        default=None,
+        metavar="URL",
+        help=(
+            "Optional HTTP(S)/SOCKS proxy URL for all Rubika traffic "
+            "(e.g. http://127.0.0.1:8080, socks5://127.0.0.1:1080). "
+            f"Falls back to ${ENV_PROXY} when unset."
+        ),
+    )
 
     sub = parser.add_subparsers(dest="command", required=True)
 
     send_p = sub.add_parser("send", help="Send a file to Saved Messages.")
-    send_p.add_argument("file", type=Path, help="Path to the file to send.")
+    send_p.add_argument("file", help="Path to the file to send, or a full direct http(s) URL.")
     send_p.add_argument(
         "--fresh",
         action="store_true",
@@ -85,20 +110,77 @@ def parse_args() -> argparse.Namespace:
         type=parse_chunk_size,
         default=None,
         metavar="SIZE",
-        help="Override upload chunk size (examples: 104857600, 100mb, 1gb).",
+        help=(
+            "Override upload chunk size (examples: 104857600, 100mb, 1gb). "
+            f"Default is {MAX_PART_SIZE // (1024 * 1024)}mb."
+        ),
     )
     send_p.add_argument(
         "--with-password",
         action="store_true",
         help="Protect the generated ZIP with a random password (disabled by default).",
     )
+    send_p.add_argument(
+        "--parallel",
+        type=int,
+        default=MAX_PARALLEL_UPLOADS,
+        metavar="N",
+        help=(
+            "Number of parts to upload concurrently "
+            f"(default: {MAX_PARALLEL_UPLOADS}). Use 1 to disable parallelism."
+        ),
+    )
+
+    list_p = sub.add_parser("list", help="List relay files in Saved Messages.")
+    list_p.add_argument(
+        "--page",
+        type=int,
+        default=1,
+        metavar="N",
+        help="1-based results page to show (default: 1).",
+    )
+    list_p.add_argument(
+        "--page-size",
+        type=int,
+        default=25,
+        metavar="N",
+        help="Number of files per page (default: 25).",
+    )
 
     recv_p = sub.add_parser("receive", help="Download relay files from Saved Messages.")
-    recv_p.add_argument("--output-dir", type=Path, default=Path.cwd(), help="Directory to save files (default: CWD).")
+    recv_p.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Directory to save restored files "
+            "(default: current working directory)."
+        ),
+    )
     recv_p.add_argument(
         "--keep",
         action="store_true",
         help="Keep messages in Saved Messages after downloading (do not delete them).",
+    )
+    recv_p.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Discard cached partial downloads and start receiving from scratch.",
+    )
+    recv_p.add_argument(
+        "--skip-unzip",
+        action="store_true",
+        help="Assemble and save the received ZIP archive without extracting it.",
+    )
+    recv_p.add_argument(
+        "--parallel",
+        type=int,
+        default=MAX_PARALLEL_DOWNLOADS,
+        metavar="N",
+        help=(
+            "Number of parts to download concurrently "
+            f"(default: {MAX_PARALLEL_DOWNLOADS}). Use 1 to disable parallelism."
+        ),
     )
 
     sub.add_parser("logout", help="Clear local session file.")
@@ -110,34 +192,112 @@ def _session_dir_for(data_dir: Path) -> Path:
     return data_dir / "sessions"
 
 
-async def cmd_send(args: argparse.Namespace) -> int:
-    file_path = args.file.expanduser().resolve()
-    if not file_path.is_file():
-        raise CliError(f"File not found: {file_path}")
+def _render_text_table(headers: list[str], rows: list[list[str]]) -> str:
+    widths = [len(header) for header in headers]
+    for row in rows:
+        for idx, value in enumerate(row):
+            widths[idx] = max(widths[idx], len(value))
 
+    def build_row(values: list[str]) -> str:
+        return "| " + " | ".join(value.ljust(widths[idx]) for idx, value in enumerate(values)) + " |"
+
+    border = "+-" + "-+-".join("-" * width for width in widths) + "-+"
+    table_lines = [border, build_row(headers), border]
+    table_lines.extend(build_row(row) for row in rows)
+    table_lines.append(border)
+    return "\n".join(table_lines)
+
+
+async def cmd_send(args: argparse.Namespace) -> int:
     data_dir = resolve_data_dir(args.data_dir)
     session_dir = _session_dir_for(data_dir)
+    proxy = resolve_proxy(args.proxy)
+    if proxy:
+        print(f"Using proxy: {proxy}")
 
     client = await login_with_persisted_session(
         session_name=args.session_name,
         session_dir=session_dir,
         phone_number=args.phone,
+        proxy=proxy,
     )
 
     try:
-        message_ids, password = await send_relay_file(
+        manifest, password = await send_relay_file(
             client,
-            file_path,
+            args.file,
             fresh=args.fresh,
             with_password=args.with_password,
             chunk_size=args.chunk_size,
+            parallel=args.parallel,
         )
         print()
-        print(f"Sent {len(message_ids)} part(s) to Saved Messages.")
+        print(f"Sent {len(manifest)} part(s) to Saved Messages.")
         if password:
             print(f"Archive password: {password}")
         else:
             print("Archive password: (none)")
+        print()
+        print("Upload Manifest")
+        print(
+            _render_text_table(
+                ["Part", "File", "SHA256", "Message ID"],
+                [
+                    [
+                        entry["index"],
+                        entry["file"],
+                        entry["sha256"],
+                        entry["message_id"],
+                    ]
+                    for entry in manifest
+                ],
+            )
+        )
+        return 0
+    finally:
+        await safe_disconnect(client)
+
+
+async def cmd_list(args: argparse.Namespace) -> int:
+    data_dir = resolve_data_dir(args.data_dir)
+    session_dir = _session_dir_for(data_dir)
+    proxy = resolve_proxy(args.proxy)
+    if proxy:
+        print(f"Using proxy: {proxy}")
+
+    client = await login_with_persisted_session(
+        session_name=args.session_name,
+        session_dir=session_dir,
+        phone_number=args.phone,
+        proxy=proxy,
+    )
+
+    try:
+        rows, total_files, total_pages = await list_relay_files(
+            client,
+            page=args.page,
+            page_size=args.page_size,
+        )
+        print(f"Relay files: {total_files} total, page {args.page}/{total_pages}")
+        if not rows:
+            print("No files on this page.")
+            return 0
+        print()
+        print(
+            _render_text_table(
+                ["#", "File", "Parts", "Status", "Latest Message ID"],
+                [
+                    [
+                        row["row"],
+                        row["file"],
+                        row["parts"],
+                        row["status"],
+                        row["latest_message_id"],
+                    ]
+                    for row in rows
+                ],
+            )
+        )
         return 0
     finally:
         await safe_disconnect(client)
@@ -146,20 +306,54 @@ async def cmd_send(args: argparse.Namespace) -> int:
 async def cmd_receive(args: argparse.Namespace) -> int:
     data_dir = resolve_data_dir(args.data_dir)
     session_dir = _session_dir_for(data_dir)
+    output_dir = (
+        args.output_dir.expanduser().resolve()
+        if args.output_dir is not None
+        else Path.cwd().resolve()
+    )
+
+    proxy = resolve_proxy(args.proxy)
+    if proxy:
+        print(f"Using proxy: {proxy}")
 
     client = await login_with_persisted_session(
         session_name=args.session_name,
         session_dir=session_dir,
         phone_number=args.phone,
+        proxy=proxy,
     )
 
     try:
-        results = await receive_relay_files(client, args.output_dir, keep=args.keep)
+        results, manifest = await receive_relay_files(
+            client,
+            output_dir,
+            keep=args.keep,
+            parallel=args.parallel,
+            fresh=args.fresh,
+            skip_unzip=args.skip_unzip,
+        )
         if results:
             ok = sum(1 for r in results if r["status"] == "ok")
             failed = len(results) - ok
             print()
             print(f"Done. {ok} file(s) verified, {failed} failed.")
+            if manifest:
+                print()
+                print("Download Manifest")
+                print(
+                    _render_text_table(
+                        ["Part", "File", "SHA256", "Message ID"],
+                        [
+                            [
+                                entry["index"],
+                                entry["file"],
+                                entry["sha256"],
+                                entry["message_id"],
+                            ]
+                            for entry in manifest
+                        ],
+                    )
+                )
         return 0
     finally:
         await safe_disconnect(client)
@@ -187,6 +381,8 @@ def main() -> int:
     try:
         if args.command == "send":
             return asyncio.run(cmd_send(args))
+        if args.command == "list":
+            return asyncio.run(cmd_list(args))
         if args.command == "receive":
             return asyncio.run(cmd_receive(args))
         if args.command == "logout":
