@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import random
 import re
 import shutil
-import tempfile
-import time
 from pathlib import Path
 from typing import Any
 
@@ -15,11 +14,39 @@ from rubpy import Client
 from .config import FILE_CHUNK_SIZE, MAX_PARALLEL_DOWNLOADS, MAX_RETRIES, RELAY_TAG, RETRY_JITTER_SECONDS
 from .errors import CliError
 from .file_ops import sha256_hash
-from .progress import TransferProgress
+from .progress import MultiProgress
 
 _CAPTION_RE = re.compile(
     re.escape(RELAY_TAG) + r"\s+(.+?)\s+\|\s+(\d+)/(\d+)\s+\|\s+sha256:([0-9a-f]{64})"
 )
+
+_RECV_WORK_ROOT = ".relay-recv"
+_SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _sanitize_for_path(name: str) -> str:
+    cleaned = _SAFE_NAME_RE.sub("_", name).strip("._") or "file"
+    return cleaned[:80]
+
+
+def _recv_work_dir(output_dir: Path, original_name: str, total: int) -> Path:
+    """Deterministic per-transfer work dir so partial downloads can be resumed."""
+    safe = _sanitize_for_path(original_name)
+    digest = hashlib.sha256(original_name.encode("utf-8")).hexdigest()[:10]
+    return output_dir / _RECV_WORK_ROOT / f"{safe}-{total}-{digest}"
+
+
+def _recv_part_path(work_dir: Path, idx: int) -> Path:
+    return work_dir / f"part_{idx:03d}.bin"
+
+
+def _fmt_size(num_bytes: int) -> str:
+    value = float(max(int(num_bytes), 0))
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} {unit}"
+        value /= 1024
+    return f"{value:.1f} TB"
 
 
 def _parse_caption(text: str) -> dict | None:
@@ -105,24 +132,29 @@ async def _download_with_retry(
     client: Client,
     file_inline,
     save_as: str,
-    progress: TransferProgress | None,
+    *,
+    progress: "MultiProgress | None" = None,
+    slot_idx: int | None = None,
     retries: int = MAX_RETRIES,
 ) -> str:
     for attempt in range(1, retries + 1):
         try:
-            await client.download(
-                file_inline,
-                save_as=save_as,
-                callback=progress.callback if progress else None,
-            )
+            if progress is not None and slot_idx is not None:
+                def _cb(total: int, current: int) -> None:
+                    progress.update_slot(slot_idx, current)
+                await client.download(file_inline, save_as=save_as, callback=_cb)
+            else:
+                await client.download(file_inline, save_as=save_as)
             return save_as
         except Exception as exc:
-            if progress:
-                progress.finish()
             if attempt == retries:
                 raise CliError(f"Download failed after {retries} attempts: {exc}") from exc
             wait = 2 ** attempt + random.uniform(0.0, RETRY_JITTER_SECONDS)
-            print(f"  Download failed (attempt {attempt}/{retries}), retrying in {wait:.1f}s... ({exc})")
+            msg = f"  Download failed (attempt {attempt}/{retries}), retrying in {wait:.1f}s... ({exc})"
+            if progress is not None:
+                progress.log(msg)
+            else:
+                print(msg)
             await asyncio.sleep(wait)
     raise CliError(f"Download failed after {retries} attempts.")
 
@@ -133,6 +165,7 @@ async def receive_relay_files(
     *,
     keep: bool = False,
     parallel: int = MAX_PARALLEL_DOWNLOADS,
+    fresh: bool = False,
 ) -> list[dict]:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -143,6 +176,12 @@ async def receive_relay_files(
 
     if parallel < 1:
         raise CliError("parallel must be >= 1.")
+
+    if fresh:
+        fresh_root = output_dir / _RECV_WORK_ROOT
+        if fresh_root.exists():
+            print(f"--fresh: removing cached partial downloads at {fresh_root}")
+            shutil.rmtree(fresh_root, ignore_errors=True)
 
     print("Fetching messages from Saved Messages...")
     relay_msgs = await _fetch_relay_messages(client, object_guid)
@@ -194,7 +233,8 @@ async def receive_relay_files(
             )
             continue
 
-        work_dir = Path(tempfile.mkdtemp(prefix="relay_parts_", dir=str(output_dir)))
+        work_dir = _recv_work_dir(output_dir, original_name, total)
+        work_dir.mkdir(parents=True, exist_ok=True)
         group_message_ids: list[str] = []
         part_paths_by_idx: dict[int, Path] = {}
         status = "ok"
@@ -204,10 +244,55 @@ async def receive_relay_files(
             msg, _meta = part_map[idx]
             group_message_ids.append(str(msg.message_id))
 
-        worker_count = max(1, min(parallel, total))
-        show_progress = worker_count == 1
-        if worker_count > 1:
-            print(f"Downloading {total} part(s) with up to {worker_count} concurrent transfer(s)...")
+        # Detect already-downloaded parts by verifying on-disk sha256 against the caption.
+        already_done: dict[int, Path] = {}
+        already_bytes = 0
+        for idx in range(1, total + 1):
+            _, meta = part_map[idx]
+            cached = _recv_part_path(work_dir, idx)
+            if cached.is_file():
+                try:
+                    if sha256_hash(cached) == meta["sha256"]:
+                        already_done[idx] = cached
+                        already_bytes += cached.stat().st_size
+                    else:
+                        cached.unlink(missing_ok=True)
+                except OSError:
+                    cached.unlink(missing_ok=True)
+
+        pending_idxs = [i for i in range(1, total + 1) if i not in already_done]
+        if already_done:
+            print(
+                f"Resuming {original_name}: {len(already_done)}/{total} part(s) "
+                f"already downloaded ({_fmt_size(already_bytes)}), "
+                f"{len(pending_idxs)} remaining."
+            )
+
+        part_paths_by_idx.update(already_done)
+
+        worker_count = max(1, min(parallel, max(1, len(pending_idxs))))
+        if pending_idxs:
+            if worker_count > 1:
+                print(
+                    f"Downloading {len(pending_idxs)} part(s) with up to "
+                    f"{worker_count} concurrent transfer(s)..."
+                )
+            else:
+                print(f"Downloading {len(pending_idxs)} part(s)...")
+
+        overall_total = 0
+        for idx in range(1, total + 1):
+            msg, _ = part_map[idx]
+            overall_total += int(getattr(msg.file_inline, "size", 0) or 0)
+
+        progress = MultiProgress(
+            overall_label=f"Download {original_name}",
+            overall_total=overall_total,
+            slot_count=worker_count,
+        )
+        # Credit already-completed parts to the overall bar.
+        if already_bytes:
+            progress.overall_current = min(overall_total, already_bytes)
 
         sem = asyncio.Semaphore(worker_count)
         hash_mismatch_detected = asyncio.Event()
@@ -217,43 +302,50 @@ async def receive_relay_files(
                 return
             msg, meta = part_map[idx]
             file_inline = msg.file_inline
-            raw_name = getattr(file_inline, "file_name", None) or f"{original_name}.{idx:03d}"
-            file_name = Path(raw_name).name or f"part_{idx:03d}"
-            save_path = work_dir / f"{idx:03d}_{file_name}"
+            save_path = _recv_part_path(work_dir, idx)
+            part_size = int(getattr(file_inline, "size", 0) or 0)
 
             async with sem:
                 if hash_mismatch_detected.is_set():
                     return
-                print(f"Downloading {file_name} (part {idx}/{total})...")
-                start_time = time.time()
-                progress = TransferProgress("  Download") if show_progress else None
-                await _download_with_retry(client, file_inline, str(save_path), progress)
-                if progress:
-                    progress.finish()
-                elapsed = time.time() - start_time
+                slot_idx = progress.acquire_slot(f"part {idx}/{total}", part_size)
+                try:
+                    await _download_with_retry(
+                        client,
+                        file_inline,
+                        str(save_path),
+                        progress=progress,
+                        slot_idx=slot_idx,
+                    )
+                finally:
+                    progress.finish_slot(slot_idx)
 
             actual_hash = sha256_hash(save_path)
             if actual_hash != meta["sha256"]:
-                print(f"  [part {idx}/{total}] HASH MISMATCH! expected {meta['sha256'][:16]}... got {actual_hash[:16]}...")
+                progress.log(
+                    f"  [part {idx}/{total}] HASH MISMATCH! expected {meta['sha256'][:16]}... "
+                    f"got {actual_hash[:16]}..."
+                )
+                # Remove corrupt part so the next run re-downloads it.
+                save_path.unlink(missing_ok=True)
                 hash_mismatch_detected.set()
                 return
 
             part_paths_by_idx[idx] = save_path
-            if worker_count > 1:
-                print(f"  [part {idx}/{total}] downloaded and verified in {elapsed:.1f}s")
-            else:
-                print("  Hash verified OK")
 
         try:
-            tasks = [asyncio.create_task(download_one(i)) for i in range(1, total + 1)]
-            try:
-                await asyncio.gather(*tasks)
-            except Exception:
-                for t in tasks:
-                    if not t.done():
-                        t.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
-                raise
+            if pending_idxs:
+                tasks = [asyncio.create_task(download_one(i)) for i in pending_idxs]
+                try:
+                    await asyncio.gather(*tasks)
+                except Exception:
+                    for t in tasks:
+                        if not t.done():
+                            t.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    progress.close()
+                    raise
+            progress.close()
 
             if hash_mismatch_detected.is_set():
                 status = "hash_mismatch"
@@ -270,14 +362,15 @@ async def receive_relay_files(
                 restored_name = restored_path.name
                 print(f"Restored: {restored_name}")
                 delete_ids.extend(group_message_ids)
+                # Only remove the work dir once the file is fully restored.
+                shutil.rmtree(work_dir, ignore_errors=True)
 
         except CliError:
             raise
         except Exception as exc:
             status = "extract_failed"
             print(f"  Failed to restore {original_name}: {exc}")
-        finally:
-            shutil.rmtree(work_dir, ignore_errors=True)
+            # Keep work_dir in place so the next run can resume from verified parts.
 
         results.append(
             {

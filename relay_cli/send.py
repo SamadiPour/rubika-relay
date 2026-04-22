@@ -30,7 +30,7 @@ from .file_ops import (
     sha256_hash,
     split_file,
 )
-from .progress import TransferProgress
+from .progress import MultiProgress
 from .send_state import (
     build_new_state,
     clear_state_dir,
@@ -157,30 +157,39 @@ async def _send_with_retry(
     caption: str,
     retries: int = MAX_RETRIES,
     *,
-    show_progress: bool = True,
+    progress: "MultiProgress | None" = None,
+    slot_idx: int | None = None,
 ) -> tuple[Update, int]:
     for attempt in range(1, retries + 1):
-        progress = TransferProgress("  Upload") if show_progress else None
         try:
-            result = await client.send_document(
-                object_guid="me",
-                document=str(file_path),
-                caption=caption,
-                callback=progress.callback if progress else None,
-            )
-            if progress:
-                progress.finish()
+            if progress is not None and slot_idx is not None:
+                def _cb(total: int, current: int) -> None:
+                    progress.update_slot(slot_idx, current)
+                result = await client.send_document(
+                    object_guid="me",
+                    document=str(file_path),
+                    caption=caption,
+                    callback=_cb,
+                )
+            else:
+                result = await client.send_document(
+                    object_guid="me",
+                    document=str(file_path),
+                    caption=caption,
+                )
             return result, attempt
         except Exception as exc:
-            if progress:
-                progress.finish()
             if not _is_retryable_error(exc):
                 raise CliError(f"Non-retryable error while sending {file_path.name}: {exc}") from exc
             if attempt == retries:
                 raise CliError(f"Failed to send {file_path.name} after {retries} attempts: {exc}") from exc
             base_wait = min(RETRY_MAX_DELAY_SECONDS, RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1)))
             wait = base_wait + random.uniform(0.0, RETRY_JITTER_SECONDS)
-            print(f"  [{file_path.name}] send failed (attempt {attempt}/{retries}), retrying in {wait:.1f}s... ({exc})")
+            msg = f"  [{file_path.name}] send failed (attempt {attempt}/{retries}), retrying in {wait:.1f}s... ({exc})"
+            if progress is not None:
+                progress.log(msg)
+            else:
+                print(msg)
             await asyncio.sleep(wait)
     raise CliError(f"Failed to send {file_path.name} after {retries} attempts.")
 
@@ -310,9 +319,17 @@ async def send_relay_file(
             return message_ids, password_value
 
         worker_count = max(1, min(parallel, len(pending)))
-        show_progress = worker_count == 1
         if worker_count > 1:
             print(f"Uploading {len(pending)} part(s) with up to {worker_count} concurrent transfer(s)...")
+        else:
+            print(f"Uploading {len(pending)} part(s)...")
+
+        overall_total = sum(int(p.get("size") or 0) for p in pending)
+        progress = MultiProgress(
+            overall_label="Upload",
+            overall_total=overall_total,
+            slot_count=worker_count,
+        )
 
         sem = asyncio.Semaphore(worker_count)
         state_lock = asyncio.Lock()
@@ -336,17 +353,21 @@ async def send_relay_file(
             file_hash = str(part.get("sha256") or sha256_hash(part_path))
             part["sha256"] = file_hash
             caption = f"{RELAY_TAG} {original_name} | {idx}/{total} | sha256:{file_hash}"
+            part_size = int(part.get("size") or part_path.stat().st_size)
 
             async with sem:
-                print(f"Sending part {idx}/{total} ({part_path.name})...")
-                start_time = time.time()
-                result, used_attempts = await _send_with_retry(
-                    client,
-                    part_path,
-                    caption,
-                    show_progress=show_progress,
-                )
-                elapsed = time.time() - start_time
+                slot_label = f"part {idx}/{total}"
+                slot_idx = progress.acquire_slot(slot_label, part_size)
+                try:
+                    result, used_attempts = await _send_with_retry(
+                        client,
+                        part_path,
+                        caption,
+                        progress=progress,
+                        slot_idx=slot_idx,
+                    )
+                finally:
+                    progress.finish_slot(slot_idx)
 
             mid = _extract_message_id(result)
             async with state_lock:
@@ -356,7 +377,6 @@ async def send_relay_file(
                 state["status"] = "uploading"
                 state["last_error"] = None
                 save_state(state_dir, state)
-            print(f"  [part {idx}/{total}] sent as message {mid} in {elapsed:.1f}s")
 
         tasks = [asyncio.create_task(upload_one(p)) for p in pending]
         try:
@@ -365,9 +385,10 @@ async def send_relay_file(
             for t in tasks:
                 if not t.done():
                     t.cancel()
-            # Drain cancellations so we don't leak tasks.
             await asyncio.gather(*tasks, return_exceptions=True)
+            progress.close()
             raise
+        progress.close()
 
         state["status"] = "completed"
         state["last_error"] = None

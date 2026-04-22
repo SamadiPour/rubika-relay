@@ -147,6 +147,11 @@ def parse_args() -> argparse.Namespace:
         help="Keep messages in Saved Messages after downloading (do not delete them).",
     )
     recv_p.add_argument(
+        "--fresh",
+        action="store_true",
+        help="Discard cached partial downloads and start receiving from scratch.",
+    )
+    recv_p.add_argument(
         "--parallel",
         type=int,
         default=MAX_PARALLEL_DOWNLOADS,
@@ -221,7 +226,13 @@ async def cmd_receive(args: argparse.Namespace) -> int:
     )
 
     try:
-        results = await receive_relay_files(client, output_dir, keep=args.keep, parallel=args.parallel)
+        results = await receive_relay_files(
+            client,
+            output_dir,
+            keep=args.keep,
+            parallel=args.parallel,
+            fresh=args.fresh,
+        )
         if results:
             ok = sum(1 for r in results if r["status"] == "ok")
             failed = len(results) - ok
