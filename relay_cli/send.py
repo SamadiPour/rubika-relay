@@ -211,6 +211,20 @@ def _build_part_entries(parts: list[Path]) -> list[dict[str, Any]]:
     return entries
 
 
+def _build_upload_manifest(parts: list[dict[str, Any]]) -> list[dict[str, str]]:
+    manifest: list[dict[str, str]] = []
+    for part in parts:
+        manifest.append(
+            {
+                "index": str(part.get("index") or ""),
+                "file": str(part.get("name") or ""),
+                "sha256": str(part.get("sha256") or ""),
+                "message_id": str(part.get("message_id") or "unknown"),
+            }
+        )
+    return manifest
+
+
 def _load_or_prepare_state(
     file_path: Path,
     state_dir: Path,
@@ -265,10 +279,10 @@ async def send_relay_file(
     with_password: bool = False,
     chunk_size: int | None = None,
     parallel: int = MAX_PARALLEL_UPLOADS,
-) -> tuple[list[str], str | None]:
+) -> tuple[list[dict[str, str]], str | None]:
     """Zip, split, hash, and send a file to Saved Messages.
 
-    Returns (list_of_message_ids, zip_password_or_none).
+    Returns (upload_manifest, zip_password_or_none).
     """
     file_path, url_temp_dir = _resolve_source_file(source)
     if chunk_size is not None and chunk_size <= 0:
@@ -302,21 +316,21 @@ async def send_relay_file(
             shutil.rmtree(url_temp_dir, ignore_errors=True)
 
     if start_idx > total:
-        message_ids = [str(part.get("message_id") or "unknown") for part in parts]
+        manifest = _build_upload_manifest(parts)
         print("Upload already completed in local state. Cleaning up local state directory.")
         clear_state_dir(state_dir)
         _cleanup_url_temp_dir()
-        return message_ids, password_value
+        return manifest, password_value
 
     try:
         pending = [p for p in parts[start_idx - 1:] if not p.get("message_id")]
         if not pending:
             state["status"] = "completed"
             save_state(state_dir, state)
-            message_ids = [str(part.get("message_id") or "unknown") for part in parts]
+            manifest = _build_upload_manifest(parts)
             clear_state_dir(state_dir)
             _cleanup_url_temp_dir()
-            return message_ids, password_value
+            return manifest, password_value
 
         worker_count = max(1, min(parallel, len(pending)))
         if worker_count > 1:
@@ -394,11 +408,11 @@ async def send_relay_file(
         state["last_error"] = None
         save_state(state_dir, state)
 
-        message_ids = [str(part.get("message_id") or "unknown") for part in parts]
+        manifest = _build_upload_manifest(parts)
         clear_state_dir(state_dir)
         _cleanup_url_temp_dir()
 
-        return message_ids, password_value
+        return manifest, password_value
 
     except Exception as exc:
         state["status"] = "interrupted"

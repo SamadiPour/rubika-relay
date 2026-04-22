@@ -171,6 +171,22 @@ def _session_dir_for(data_dir: Path) -> Path:
     return data_dir / "sessions"
 
 
+def _render_text_table(headers: list[str], rows: list[list[str]]) -> str:
+    widths = [len(header) for header in headers]
+    for row in rows:
+        for idx, value in enumerate(row):
+            widths[idx] = max(widths[idx], len(value))
+
+    def build_row(values: list[str]) -> str:
+        return "| " + " | ".join(value.ljust(widths[idx]) for idx, value in enumerate(values)) + " |"
+
+    border = "+-" + "-+-".join("-" * width for width in widths) + "-+"
+    table_lines = [border, build_row(headers), border]
+    table_lines.extend(build_row(row) for row in rows)
+    table_lines.append(border)
+    return "\n".join(table_lines)
+
+
 async def cmd_send(args: argparse.Namespace) -> int:
     data_dir = resolve_data_dir(args.data_dir)
     session_dir = _session_dir_for(data_dir)
@@ -186,7 +202,7 @@ async def cmd_send(args: argparse.Namespace) -> int:
     )
 
     try:
-        message_ids, password = await send_relay_file(
+        manifest, password = await send_relay_file(
             client,
             args.file,
             fresh=args.fresh,
@@ -195,11 +211,27 @@ async def cmd_send(args: argparse.Namespace) -> int:
             parallel=args.parallel,
         )
         print()
-        print(f"Sent {len(message_ids)} part(s) to Saved Messages.")
+        print(f"Sent {len(manifest)} part(s) to Saved Messages.")
         if password:
             print(f"Archive password: {password}")
         else:
             print("Archive password: (none)")
+        print()
+        print("Upload Manifest")
+        print(
+            _render_text_table(
+                ["Part", "File", "SHA256", "Message ID"],
+                [
+                    [
+                        entry["index"],
+                        entry["file"],
+                        entry["sha256"],
+                        entry["message_id"],
+                    ]
+                    for entry in manifest
+                ],
+            )
+        )
         return 0
     finally:
         await safe_disconnect(client)
