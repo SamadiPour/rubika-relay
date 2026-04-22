@@ -22,6 +22,8 @@ _CAPTION_RE = re.compile(
 
 _RECV_WORK_ROOT = ".relay-recv"
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+_HASH_MISMATCH_RETRIES = 4
+_HASH_MISMATCH_BASE_WAIT_SECONDS = 5.0
 
 
 def _sanitize_for_path(name: str) -> str:
@@ -87,6 +89,26 @@ def _assemble_parts(part_paths: list[Path], archive_path: Path) -> None:
                     out.write(chunk)
 
 
+def _archive_output_path(output_dir: Path, original_name: str) -> Path:
+    return _unique_path(output_dir / f"{_safe_file_name(original_name)}.zip")
+
+
+def _build_download_manifest(part_map: dict[int, tuple[Any, dict[str, Any]]], total: int) -> list[dict[str, str]]:
+    manifest: list[dict[str, str]] = []
+    for idx in range(1, total + 1):
+        msg, meta = part_map[idx]
+        remote_name = getattr(msg.file_inline, "file_name", None) or f"part_{idx:03d}"
+        manifest.append(
+            {
+                "index": str(idx),
+                "file": str(Path(remote_name).name),
+                "sha256": str(meta["sha256"]),
+                "message_id": str(msg.message_id),
+            }
+        )
+    return manifest
+
+
 def _extract_archive_to_original_name(archive_path: Path, output_dir: Path, original_name: str) -> Path:
     target_path = _unique_path(output_dir / _safe_file_name(original_name))
 
@@ -104,11 +126,17 @@ def _extract_archive_to_original_name(archive_path: Path, output_dir: Path, orig
     return target_path
 
 
-async def _fetch_relay_messages(client: Client, object_guid: str, limit_per_page: int = 50, max_pages: int = 4) -> list:
+async def _fetch_relay_messages(
+    client: Client,
+    object_guid: str,
+    limit_per_page: int = 50,
+    max_pages: int | None = 4,
+) -> list:
     relay_msgs = []
     max_id = "0"
+    page_count = 0
 
-    for _ in range(max_pages):
+    while max_pages is None or page_count < max_pages:
         result = await client.get_messages(object_guid, max_id=max_id, limit=str(limit_per_page))
         messages = getattr(result, "messages", None)
         if not messages:
@@ -119,13 +147,89 @@ async def _fetch_relay_messages(client: Client, object_guid: str, limit_per_page
             if text.startswith(RELAY_TAG) and getattr(msg, "file_inline", None) is not None:
                 relay_msgs.append(msg)
 
-        ids = [getattr(m, "message_id", "0") for m in messages]
-        min_id = min(ids, key=lambda x: int(x) if str(x).isdigit() else 0)
-        if min_id == max_id or len(messages) < limit_per_page:
+        ids = [str(getattr(m, "message_id", "0")) for m in messages]
+        numeric_ids = [int(message_id) for message_id in ids if message_id.isdigit()]
+        if not numeric_ids:
             break
-        max_id = str(min_id)
+        next_max_id = str(min(numeric_ids) - 1)
+        if next_max_id == max_id:
+            break
+        max_id = next_max_id
+        page_count += 1
 
     return relay_msgs
+
+
+def _group_relay_messages(relay_msgs: list) -> dict[tuple[str, int], dict[int, tuple[Any, dict[str, Any]]]]:
+    grouped: dict[tuple[str, int], dict[int, tuple[Any, dict[str, Any]]]] = {}
+    for msg in relay_msgs:
+        text = getattr(msg, "text", "") or ""
+        meta = _parse_caption(text)
+        if not meta:
+            print(f"  Skipping message with unparseable caption: {text[:60]}")
+            continue
+
+        total = int(meta["total"])
+        part = int(meta["part"])
+        if part < 1 or total < 1 or part > total:
+            print(f"  Skipping invalid relay metadata: part={part}, total={total}")
+            continue
+
+        key = (str(meta["original_name"]), total)
+        per_part = grouped.setdefault(key, {})
+        # Keep the first occurrence (newest message page order) when duplicates exist.
+        if part not in per_part:
+            per_part[part] = (msg, meta)
+
+    return grouped
+
+
+async def list_relay_files(
+    client: Client,
+    *,
+    page: int = 1,
+    page_size: int = 25,
+) -> tuple[list[dict[str, str]], int, int]:
+    if page < 1:
+        raise CliError("page must be >= 1.")
+    if page_size < 1:
+        raise CliError("page_size must be >= 1.")
+
+    object_guid = str(getattr(client, "guid", "") or "")
+    if not object_guid:
+        raise CliError("Session is missing user GUID; cannot access Saved Messages.")
+
+    relay_msgs = await _fetch_relay_messages(
+        client,
+        object_guid,
+        limit_per_page=max(50, min(200, page_size)),
+        max_pages=None,
+    )
+    grouped = _group_relay_messages(relay_msgs)
+
+    rows: list[dict[str, str]] = []
+    grouped_items = list(grouped.items())
+    total_files = len(grouped_items)
+    total_pages = max(1, (total_files + page_size - 1) // page_size)
+    start = (page - 1) * page_size
+    end = start + page_size
+
+    for row_index, ((original_name, total), part_map) in enumerate(grouped_items[start:end], start + 1):
+        latest_message_id = "unknown"
+        if part_map:
+            first_key = next(iter(part_map))
+            latest_message_id = str(getattr(part_map[first_key][0], "message_id", "unknown"))
+        rows.append(
+            {
+                "row": str(row_index),
+                "file": _safe_file_name(original_name),
+                "parts": f"{len(part_map)}/{total}",
+                "status": "complete" if len(part_map) == total else "missing_parts",
+                "latest_message_id": latest_message_id,
+            }
+        )
+
+    return rows, total_files, total_pages
 
 
 async def _download_with_retry(
@@ -159,6 +263,54 @@ async def _download_with_retry(
     raise CliError(f"Download failed after {retries} attempts.")
 
 
+async def _download_verified_part(
+    client: Client,
+    *,
+    file_inline,
+    save_path: Path,
+    expected_hash: str,
+    progress: "MultiProgress | None" = None,
+    slot_idx: int | None = None,
+    part_label: str,
+) -> bool:
+    for attempt in range(1, _HASH_MISMATCH_RETRIES + 1):
+        await _download_with_retry(
+            client,
+            file_inline,
+            str(save_path),
+            progress=progress,
+            slot_idx=slot_idx,
+        )
+
+        actual_hash = sha256_hash(save_path)
+        if actual_hash == expected_hash:
+            return True
+
+        save_path.unlink(missing_ok=True)
+        if attempt == _HASH_MISMATCH_RETRIES:
+            final_message = (
+                f"  [{part_label}] HASH MISMATCH! expected {expected_hash[:16]}... got {actual_hash[:16]}... "
+                f"after {_HASH_MISMATCH_RETRIES} download attempts"
+            )
+            if progress is not None:
+                progress.log(final_message)
+            else:
+                print(final_message)
+            return False
+
+        wait = _HASH_MISMATCH_BASE_WAIT_SECONDS * (2 ** (attempt - 1)) + random.uniform(0.0, 1.0)
+        message = (
+            f"  [{part_label}] HASH MISMATCH! expected {expected_hash[:16]}... got {actual_hash[:16]}... "
+            f"retrying in {wait:.1f}s ({attempt}/{_HASH_MISMATCH_RETRIES})"
+        )
+        if progress is not None:
+            progress.log(message)
+        else:
+            print(message)
+        await asyncio.sleep(wait)
+    return False
+
+
 async def receive_relay_files(
     client: Client,
     output_dir: Path,
@@ -166,7 +318,8 @@ async def receive_relay_files(
     keep: bool = False,
     parallel: int = MAX_PARALLEL_DOWNLOADS,
     fresh: bool = False,
-) -> list[dict]:
+    skip_unzip: bool = False,
+) -> tuple[list[dict], list[dict[str, str]]]:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     object_guid = str(getattr(client, "guid", "") or "")
@@ -188,32 +341,15 @@ async def receive_relay_files(
 
     if not relay_msgs:
         print("No relay files found.")
-        return []
+        return [], []
 
     print(f"Found {len(relay_msgs)} relay file(s).")
 
     results = []
     delete_ids = []
+    manifest_rows: list[dict[str, str]] = []
 
-    grouped: dict[tuple[str, int], dict[int, tuple[Any, dict[str, Any]]]] = {}
-    for msg in relay_msgs:
-        text = getattr(msg, "text", "") or ""
-        meta = _parse_caption(text)
-        if not meta:
-            print(f"  Skipping message with unparseable caption: {text[:60]}")
-            continue
-
-        total = int(meta["total"])
-        part = int(meta["part"])
-        if part < 1 or total < 1 or part > total:
-            print(f"  Skipping invalid relay metadata: part={part}, total={total}")
-            continue
-
-        key = (str(meta["original_name"]), total)
-        per_part = grouped.setdefault(key, {})
-        # Keep the first occurrence (newest message page order) when duplicates exist.
-        if part not in per_part:
-            per_part[part] = (msg, meta)
+    grouped = _group_relay_messages(relay_msgs)
 
     for (original_name, total), part_map in grouped.items():
         missing = [idx for idx in range(1, total + 1) if idx not in part_map]
@@ -310,24 +446,19 @@ async def receive_relay_files(
                     return
                 slot_idx = progress.acquire_slot(f"part {idx}/{total}", part_size)
                 try:
-                    await _download_with_retry(
+                    verified = await _download_verified_part(
                         client,
-                        file_inline,
-                        str(save_path),
+                        file_inline=file_inline,
+                        save_path=save_path,
+                        expected_hash=meta["sha256"],
                         progress=progress,
                         slot_idx=slot_idx,
+                        part_label=f"part {idx}/{total}",
                     )
                 finally:
                     progress.finish_slot(slot_idx)
 
-            actual_hash = sha256_hash(save_path)
-            if actual_hash != meta["sha256"]:
-                progress.log(
-                    f"  [part {idx}/{total}] HASH MISMATCH! expected {meta['sha256'][:16]}... "
-                    f"got {actual_hash[:16]}..."
-                )
-                # Remove corrupt part so the next run re-downloads it.
-                save_path.unlink(missing_ok=True)
+            if not verified:
                 hash_mismatch_detected.set()
                 return
 
@@ -339,6 +470,7 @@ async def receive_relay_files(
                 try:
                     await asyncio.gather(*tasks)
                 except Exception:
+                    hash_mismatch_detected.set()
                     for t in tasks:
                         if not t.done():
                             t.cancel()
@@ -354,14 +486,21 @@ async def receive_relay_files(
                 archive_path = work_dir / "relay_archive.zip"
                 _assemble_parts(part_paths, archive_path)
 
-                restored_path = _extract_archive_to_original_name(
-                    archive_path=archive_path,
-                    output_dir=output_dir,
-                    original_name=original_name,
-                )
+                if skip_unzip:
+                    restored_path = _archive_output_path(output_dir, original_name)
+                    archive_path.replace(restored_path)
+                    print(f"Saved archive: {restored_path.name}")
+                else:
+                    restored_path = _extract_archive_to_original_name(
+                        archive_path=archive_path,
+                        output_dir=output_dir,
+                        original_name=original_name,
+                    )
                 restored_name = restored_path.name
-                print(f"Restored: {restored_name}")
+                if not skip_unzip:
+                    print(f"Restored: {restored_name}")
                 delete_ids.extend(group_message_ids)
+                manifest_rows.extend(_build_download_manifest(part_map, total))
                 # Only remove the work dir once the file is fully restored.
                 shutil.rmtree(work_dir, ignore_errors=True)
 
@@ -389,4 +528,4 @@ async def receive_relay_files(
         except Exception as exc:
             print(f"  Warning: failed to delete messages: {exc}")
 
-    return results
+    return results, manifest_rows
