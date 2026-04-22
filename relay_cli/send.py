@@ -4,6 +4,8 @@ import asyncio
 import hashlib
 import random
 import re
+import shutil
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -15,6 +17,7 @@ from rubpy.types import Update
 
 from .config import (
     FILE_CHUNK_SIZE,
+    MAX_PARALLEL_UPLOADS,
     MAX_RETRIES,
     RELAY_TAG,
     RETRY_BASE_DELAY_SECONDS,
@@ -87,12 +90,16 @@ def _clean_file_name(name: str | None) -> str:
     return cleaned or "downloaded_file"
 
 
-def _download_source_url(source_url: str, data_dir: Path) -> Path:
-    cache_dir = data_dir / "url-sources"
-    cache_dir.mkdir(parents=True, exist_ok=True)
+def _download_source_url(source_url: str) -> tuple[Path, Path]:
+    """Download a URL source to a fresh temp directory.
+
+    Returns (downloaded_file_path, temp_dir_to_cleanup).
+    """
+    cache_dir = Path(tempfile.mkdtemp(prefix="rubika-relay-url-"))
 
     request = Request(source_url, headers={"User-Agent": "rubika-relay-cli/0.1"})
     temp_path: Path | None = None
+    target_path: Path | None = None
     try:
         with urlopen(request, timeout=120) as response:
             remote_name = _filename_from_content_disposition(response.headers.get("Content-Disposition"))
@@ -110,34 +117,38 @@ def _download_source_url(source_url: str, data_dir: Path) -> Path:
     except Exception as exc:
         if temp_path and temp_path.exists():
             temp_path.unlink(missing_ok=True)
+        shutil.rmtree(cache_dir, ignore_errors=True)
         raise CliError(f"Failed to download URL source: {source_url} ({exc})") from exc
 
-    if target_path.exists():
-        target_path.unlink(missing_ok=True)
+    assert target_path is not None and temp_path is not None
     temp_path.replace(target_path)
-    return target_path
+    return target_path, cache_dir
 
 
-def _resolve_source_file(source: str | Path, data_dir: Path | None) -> Path:
+def _resolve_source_file(source: str | Path) -> tuple[Path, Path | None]:
+    """Resolve a user-provided source into a local file path.
+
+    Returns (file_path, temp_dir_to_cleanup_after_upload). The second element
+    is non-None only when the source was downloaded from a URL into a
+    temporary directory that should be removed after a successful upload.
+    """
     if isinstance(source, Path):
         candidate = source.expanduser().resolve()
         if not candidate.is_file():
             raise CliError(f"File not found: {candidate}")
-        return candidate
+        return candidate, None
 
     source_text = source.strip()
     if _looks_like_direct_url(source_text):
-        if data_dir is None:
-            data_dir = Path.home() / ".rubika-relay"
         print(f"Downloading source from URL: {source_text}")
-        downloaded_path = _download_source_url(source_text, data_dir.resolve())
+        downloaded_path, temp_dir = _download_source_url(source_text)
         print(f"Saved URL source to: {downloaded_path}")
-        return downloaded_path
+        return downloaded_path, temp_dir
 
     candidate = Path(source_text).expanduser().resolve()
     if not candidate.is_file():
         raise CliError(f"File not found: {candidate}")
-    return candidate
+    return candidate, None
 
 
 async def _send_with_retry(
@@ -145,27 +156,31 @@ async def _send_with_retry(
     file_path: Path,
     caption: str,
     retries: int = MAX_RETRIES,
+    *,
+    show_progress: bool = True,
 ) -> tuple[Update, int]:
     for attempt in range(1, retries + 1):
-        progress = TransferProgress("  Upload")
+        progress = TransferProgress("  Upload") if show_progress else None
         try:
             result = await client.send_document(
                 object_guid="me",
                 document=str(file_path),
                 caption=caption,
-                callback=progress.callback,
+                callback=progress.callback if progress else None,
             )
-            progress.finish()
+            if progress:
+                progress.finish()
             return result, attempt
         except Exception as exc:
-            progress.finish()
+            if progress:
+                progress.finish()
             if not _is_retryable_error(exc):
                 raise CliError(f"Non-retryable error while sending {file_path.name}: {exc}") from exc
             if attempt == retries:
                 raise CliError(f"Failed to send {file_path.name} after {retries} attempts: {exc}") from exc
             base_wait = min(RETRY_MAX_DELAY_SECONDS, RETRY_BASE_DELAY_SECONDS * (2 ** (attempt - 1)))
             wait = base_wait + random.uniform(0.0, RETRY_JITTER_SECONDS)
-            print(f"  Send failed (attempt {attempt}/{retries}), retrying in {wait:.1f}s... ({exc})")
+            print(f"  [{file_path.name}] send failed (attempt {attempt}/{retries}), retrying in {wait:.1f}s... ({exc})")
             await asyncio.sleep(wait)
     raise CliError(f"Failed to send {file_path.name} after {retries} attempts.")
 
@@ -240,15 +255,17 @@ async def send_relay_file(
     fresh: bool = False,
     with_password: bool = False,
     chunk_size: int | None = None,
-    data_dir: Path | None = None,
+    parallel: int = MAX_PARALLEL_UPLOADS,
 ) -> tuple[list[str], str | None]:
     """Zip, split, hash, and send a file to Saved Messages.
 
     Returns (list_of_message_ids, zip_password_or_none).
     """
-    file_path = _resolve_source_file(source, data_dir)
+    file_path, url_temp_dir = _resolve_source_file(source)
     if chunk_size is not None and chunk_size <= 0:
         raise CliError("chunk_size must be a positive integer (bytes).")
+    if parallel < 1:
+        raise CliError("parallel must be >= 1.")
 
     state_dir = state_dir_for_source(file_path)
     state, resumed = _load_or_prepare_state(
@@ -271,17 +288,36 @@ async def send_relay_file(
     if resumed and start_idx <= total:
         print(f"Resuming upload from part {start_idx}/{total}...")
 
+    def _cleanup_url_temp_dir() -> None:
+        if url_temp_dir is not None and url_temp_dir.exists():
+            shutil.rmtree(url_temp_dir, ignore_errors=True)
+
     if start_idx > total:
         message_ids = [str(part.get("message_id") or "unknown") for part in parts]
         print("Upload already completed in local state. Cleaning up local state directory.")
         clear_state_dir(state_dir)
+        _cleanup_url_temp_dir()
         return message_ids, password_value
 
     try:
-        for part in parts[start_idx - 1:]:
-            if part.get("message_id"):
-                continue
+        pending = [p for p in parts[start_idx - 1:] if not p.get("message_id")]
+        if not pending:
+            state["status"] = "completed"
+            save_state(state_dir, state)
+            message_ids = [str(part.get("message_id") or "unknown") for part in parts]
+            clear_state_dir(state_dir)
+            _cleanup_url_temp_dir()
+            return message_ids, password_value
 
+        worker_count = max(1, min(parallel, len(pending)))
+        show_progress = worker_count == 1
+        if worker_count > 1:
+            print(f"Uploading {len(pending)} part(s) with up to {worker_count} concurrent transfer(s)...")
+
+        sem = asyncio.Semaphore(worker_count)
+        state_lock = asyncio.Lock()
+
+        async def upload_one(part: dict[str, Any]) -> None:
             idx = int(part.get("index") or 0)
             if idx <= 0:
                 raise CliError("Corrupted send state: invalid part index.")
@@ -301,16 +337,37 @@ async def send_relay_file(
             part["sha256"] = file_hash
             caption = f"{RELAY_TAG} {original_name} | {idx}/{total} | sha256:{file_hash}"
 
-            print(f"Sending part {idx}/{total} ({part_path.name})...")
-            result, used_attempts = await _send_with_retry(client, part_path, caption)
+            async with sem:
+                print(f"Sending part {idx}/{total} ({part_path.name})...")
+                start_time = time.time()
+                result, used_attempts = await _send_with_retry(
+                    client,
+                    part_path,
+                    caption,
+                    show_progress=show_progress,
+                )
+                elapsed = time.time() - start_time
+
             mid = _extract_message_id(result)
-            part["message_id"] = mid
-            part["sent_at"] = time.time()
-            part["attempts"] = int(part.get("attempts") or 0) + used_attempts
-            state["status"] = "uploading"
-            state["last_error"] = None
-            save_state(state_dir, state)
-            print(f"  Sent (message {mid})")
+            async with state_lock:
+                part["message_id"] = mid
+                part["sent_at"] = time.time()
+                part["attempts"] = int(part.get("attempts") or 0) + used_attempts
+                state["status"] = "uploading"
+                state["last_error"] = None
+                save_state(state_dir, state)
+            print(f"  [part {idx}/{total}] sent as message {mid} in {elapsed:.1f}s")
+
+        tasks = [asyncio.create_task(upload_one(p)) for p in pending]
+        try:
+            await asyncio.gather(*tasks)
+        except Exception:
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            # Drain cancellations so we don't leak tasks.
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
 
         state["status"] = "completed"
         state["last_error"] = None
@@ -318,6 +375,7 @@ async def send_relay_file(
 
         message_ids = [str(part.get("message_id") or "unknown") for part in parts]
         clear_state_dir(state_dir)
+        _cleanup_url_temp_dir()
 
         return message_ids, password_value
 

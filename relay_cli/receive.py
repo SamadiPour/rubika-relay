@@ -5,13 +5,14 @@ import random
 import re
 import shutil
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
 import pyzipper
 from rubpy import Client
 
-from .config import FILE_CHUNK_SIZE, MAX_RETRIES, RELAY_TAG, RETRY_JITTER_SECONDS
+from .config import FILE_CHUNK_SIZE, MAX_PARALLEL_DOWNLOADS, MAX_RETRIES, RELAY_TAG, RETRY_JITTER_SECONDS
 from .errors import CliError
 from .file_ops import sha256_hash
 from .progress import TransferProgress
@@ -104,15 +105,20 @@ async def _download_with_retry(
     client: Client,
     file_inline,
     save_as: str,
-    progress: TransferProgress,
+    progress: TransferProgress | None,
     retries: int = MAX_RETRIES,
 ) -> str:
     for attempt in range(1, retries + 1):
         try:
-            await client.download(file_inline, save_as=save_as, callback=progress.callback)
+            await client.download(
+                file_inline,
+                save_as=save_as,
+                callback=progress.callback if progress else None,
+            )
             return save_as
         except Exception as exc:
-            progress.finish()
+            if progress:
+                progress.finish()
             if attempt == retries:
                 raise CliError(f"Download failed after {retries} attempts: {exc}") from exc
             wait = 2 ** attempt + random.uniform(0.0, RETRY_JITTER_SECONDS)
@@ -121,13 +127,22 @@ async def _download_with_retry(
     raise CliError(f"Download failed after {retries} attempts.")
 
 
-async def receive_relay_files(client: Client, output_dir: Path, *, keep: bool = False) -> list[dict]:
+async def receive_relay_files(
+    client: Client,
+    output_dir: Path,
+    *,
+    keep: bool = False,
+    parallel: int = MAX_PARALLEL_DOWNLOADS,
+) -> list[dict]:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     object_guid = str(getattr(client, "guid", "") or "")
 
     if not object_guid:
         raise CliError("Session is missing user GUID; cannot access Saved Messages.")
+
+    if parallel < 1:
+        raise CliError("parallel must be >= 1.")
 
     print("Fetching messages from Saved Messages...")
     relay_msgs = await _fetch_relay_messages(client, object_guid)
@@ -181,35 +196,69 @@ async def receive_relay_files(client: Client, output_dir: Path, *, keep: bool = 
 
         work_dir = Path(tempfile.mkdtemp(prefix="relay_parts_", dir=str(output_dir)))
         group_message_ids: list[str] = []
-        part_paths: list[Path] = []
+        part_paths_by_idx: dict[int, Path] = {}
         status = "ok"
         restored_name = _safe_file_name(original_name)
 
-        try:
-            for idx in range(1, total + 1):
-                msg, meta = part_map[idx]
-                group_message_ids.append(str(msg.message_id))
+        for idx in range(1, total + 1):
+            msg, _meta = part_map[idx]
+            group_message_ids.append(str(msg.message_id))
 
-                file_inline = msg.file_inline
-                raw_name = getattr(file_inline, "file_name", None) or f"{original_name}.{idx:03d}"
-                file_name = Path(raw_name).name or f"part_{idx:03d}"
-                save_path = work_dir / f"{idx:03d}_{file_name}"
+        worker_count = max(1, min(parallel, total))
+        show_progress = worker_count == 1
+        if worker_count > 1:
+            print(f"Downloading {total} part(s) with up to {worker_count} concurrent transfer(s)...")
 
+        sem = asyncio.Semaphore(worker_count)
+        hash_mismatch_detected = asyncio.Event()
+
+        async def download_one(idx: int) -> None:
+            if hash_mismatch_detected.is_set():
+                return
+            msg, meta = part_map[idx]
+            file_inline = msg.file_inline
+            raw_name = getattr(file_inline, "file_name", None) or f"{original_name}.{idx:03d}"
+            file_name = Path(raw_name).name or f"part_{idx:03d}"
+            save_path = work_dir / f"{idx:03d}_{file_name}"
+
+            async with sem:
+                if hash_mismatch_detected.is_set():
+                    return
                 print(f"Downloading {file_name} (part {idx}/{total})...")
-                progress = TransferProgress("  Download")
+                start_time = time.time()
+                progress = TransferProgress("  Download") if show_progress else None
                 await _download_with_retry(client, file_inline, str(save_path), progress)
-                progress.finish()
+                if progress:
+                    progress.finish()
+                elapsed = time.time() - start_time
 
-                actual_hash = sha256_hash(save_path)
-                if actual_hash != meta["sha256"]:
-                    print(f"  HASH MISMATCH! Expected {meta['sha256'][:16]}... got {actual_hash[:16]}...")
-                    status = "hash_mismatch"
-                    break
+            actual_hash = sha256_hash(save_path)
+            if actual_hash != meta["sha256"]:
+                print(f"  [part {idx}/{total}] HASH MISMATCH! expected {meta['sha256'][:16]}... got {actual_hash[:16]}...")
+                hash_mismatch_detected.set()
+                return
 
+            part_paths_by_idx[idx] = save_path
+            if worker_count > 1:
+                print(f"  [part {idx}/{total}] downloaded and verified in {elapsed:.1f}s")
+            else:
                 print("  Hash verified OK")
-                part_paths.append(save_path)
 
-            if status == "ok":
+        try:
+            tasks = [asyncio.create_task(download_one(i)) for i in range(1, total + 1)]
+            try:
+                await asyncio.gather(*tasks)
+            except Exception:
+                for t in tasks:
+                    if not t.done():
+                        t.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                raise
+
+            if hash_mismatch_detected.is_set():
+                status = "hash_mismatch"
+            else:
+                part_paths = [part_paths_by_idx[i] for i in range(1, total + 1)]
                 archive_path = work_dir / "relay_archive.zip"
                 _assemble_parts(part_paths, archive_path)
 

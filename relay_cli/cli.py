@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 from relay_cli.auth import clear_local_session, login_with_persisted_session, safe_disconnect
-from relay_cli.config import MAX_PART_SIZE
+from relay_cli.config import MAX_PART_SIZE, MAX_PARALLEL_DOWNLOADS, MAX_PARALLEL_UPLOADS
 from relay_cli.errors import CliError
 from relay_cli.receive import receive_relay_files
 from relay_cli.send import send_relay_file
@@ -96,6 +96,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Protect the generated ZIP with a random password (disabled by default).",
     )
+    send_p.add_argument(
+        "--parallel",
+        type=int,
+        default=MAX_PARALLEL_UPLOADS,
+        metavar="N",
+        help=(
+            "Number of parts to upload concurrently "
+            f"(default: {MAX_PARALLEL_UPLOADS}). Use 1 to disable parallelism."
+        ),
+    )
 
     recv_p = sub.add_parser("receive", help="Download relay files from Saved Messages.")
     recv_p.add_argument(
@@ -111,6 +121,16 @@ def parse_args() -> argparse.Namespace:
         "--keep",
         action="store_true",
         help="Keep messages in Saved Messages after downloading (do not delete them).",
+    )
+    recv_p.add_argument(
+        "--parallel",
+        type=int,
+        default=MAX_PARALLEL_DOWNLOADS,
+        metavar="N",
+        help=(
+            "Number of parts to download concurrently "
+            f"(default: {MAX_PARALLEL_DOWNLOADS}). Use 1 to disable parallelism."
+        ),
     )
 
     sub.add_parser("logout", help="Clear local session file.")
@@ -139,7 +159,7 @@ async def cmd_send(args: argparse.Namespace) -> int:
             fresh=args.fresh,
             with_password=args.with_password,
             chunk_size=args.chunk_size,
-            data_dir=data_dir,
+            parallel=args.parallel,
         )
         print()
         print(f"Sent {len(message_ids)} part(s) to Saved Messages.")
@@ -168,7 +188,7 @@ async def cmd_receive(args: argparse.Namespace) -> int:
     )
 
     try:
-        results = await receive_relay_files(client, output_dir, keep=args.keep)
+        results = await receive_relay_files(client, output_dir, keep=args.keep, parallel=args.parallel)
         if results:
             ok = sum(1 for r in results if r["status"] == "ok")
             failed = len(results) - ok
